@@ -52,20 +52,31 @@ fi
 print_item "JetPack SDK version" "${JP_VER:-N/A}"
 
 # CUDA Toolkit
+# dpkg-query -W lists every known package matching the glob, including ones
+# that are merely referenced but not installed (empty Version, Status "not
+# installed"/"unknown"). Filter to Status "install ok installed" and take the
+# highest version so a stray/leftover package (e.g. an older cuda-toolkit-*
+# left over from a previous JetPack install) can't be picked over the real one.
 CUDA_VER=""
 if dpkg -s cuda-toolkit-12-6 >/dev/null 2>&1; then
     CUDA_VER="$(dpkg -s cuda-toolkit-12-6 2>/dev/null | sed -n 's/.*Locked at CUDA Toolkit version \([^ .]*\.[^ .]*\).*/\1/p' | head -n1)"
     if [[ -z "${CUDA_VER}" ]]; then
         CUDA_VER="$(dpkg-query -W -f='${Package}\n' cuda-toolkit-12-6 2>/dev/null | sed -n 's/^cuda-toolkit-\([0-9]\+\)-\([0-9]\+\)$/\1.\2/p')"
     fi
-elif dpkg-query -W 'cuda-toolkit-*' >/dev/null 2>&1; then
-    CUDA_PKG="$(dpkg-query -W -f='${Package}\n' 'cuda-toolkit-*' 2>/dev/null | grep -E '^cuda-toolkit-[0-9]+-[0-9]+$' | head -n1)"
+fi
+if [[ -z "${CUDA_VER}" ]]; then
+    CUDA_PKG="$(dpkg-query -W -f='${Status}\t${Package}\n' 'cuda-toolkit-*' 2>/dev/null \
+        | awk -F'\t' '$1 == "install ok installed" && $2 ~ /^cuda-toolkit-[0-9]+-[0-9]+$/ {print $2}' \
+        | sort -rV | head -n1)"
     CUDA_VER="$(printf '%s\n' "${CUDA_PKG}" | sed -n 's/^cuda-toolkit-\([0-9]\+\)-\([0-9]\+\)$/\1.\2/p')"
-elif [[ -f /usr/local/cuda/version.json ]]; then
+fi
+if [[ -z "${CUDA_VER}" && -f /usr/local/cuda/version.json ]]; then
     CUDA_VER="$(grep -m1 '"version"' /usr/local/cuda/version.json | sed 's/.*: *"//;s/".*//')"
-elif [[ -f /usr/local/cuda/version.txt ]]; then
+fi
+if [[ -z "${CUDA_VER}" && -f /usr/local/cuda/version.txt ]]; then
     CUDA_VER="$(sed -n 's/^CUDA Version //p' /usr/local/cuda/version.txt | head -n1)"
-elif have_cmd nvcc; then
+fi
+if [[ -z "${CUDA_VER}" ]] && have_cmd nvcc; then
     CUDA_VER="$(nvcc --version 2>/dev/null | awk '/release/{print $6}' | tr -d ',')"
 fi
 if [[ -n "${CUDA_VER}" && "${CUDA_VER}" != V* ]]; then
@@ -74,15 +85,27 @@ fi
 print_item "CUDA Toolkit version" "${CUDA_VER:-N/A}"
 
 # cuDNN
+CUDNN_VER=""
 if dpkg -s libcudnn9-cuda-12 >/dev/null 2>&1; then
     CUDNN_VER="$(dpkg -s libcudnn9-cuda-12 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
-elif [[ -f /usr/include/cudnn_version.h ]]; then
-    CUDNN_MAJOR="$(awk '/^#define CUDNN_MAJOR/{print $3}' /usr/include/cudnn_version.h)"
-    CUDNN_MINOR="$(awk '/^#define CUDNN_MINOR/{print $3}' /usr/include/cudnn_version.h)"
-    CUDNN_PATCH="$(awk '/^#define CUDNN_PATCHLEVEL/{print $3}' /usr/include/cudnn_version.h)"
-    CUDNN_VER="${CUDNN_MAJOR}.${CUDNN_MINOR}.${CUDNN_PATCH}"
-else
-    CUDNN_VER="$(dpkg-query -W -f='${Version}\n' 'libcudnn*' 2>/dev/null | head -n1)"
+fi
+if [[ -z "${CUDNN_VER}" ]]; then
+    # Multiarch installs put the header under /usr/include/<triplet>/, not
+    # directly in /usr/include (e.g. /usr/include/aarch64-linux-gnu/).
+    CUDNN_HEADER="$(find /usr/include -maxdepth 2 -iname 'cudnn_version.h' 2>/dev/null | head -n1)"
+    if [[ -n "${CUDNN_HEADER}" ]]; then
+        CUDNN_MAJOR="$(awk '/^#define CUDNN_MAJOR/{print $3}' "${CUDNN_HEADER}")"
+        CUDNN_MINOR="$(awk '/^#define CUDNN_MINOR/{print $3}' "${CUDNN_HEADER}")"
+        CUDNN_PATCH="$(awk '/^#define CUDNN_PATCHLEVEL/{print $3}' "${CUDNN_HEADER}")"
+        if [[ -n "${CUDNN_MAJOR}" ]]; then
+            CUDNN_VER="${CUDNN_MAJOR}.${CUDNN_MINOR}.${CUDNN_PATCH}"
+        fi
+    fi
+fi
+if [[ -z "${CUDNN_VER}" ]]; then
+    CUDNN_VER="$(dpkg-query -W -f='${Status}\t${Version}\n' 'libcudnn*' 2>/dev/null \
+        | awk -F'\t' '$1 == "install ok installed" && $2 != "" {print $2}' \
+        | sort -rV | head -n1)"
 fi
 print_item "cuDNN version" "${CUDNN_VER:-N/A}"
 
