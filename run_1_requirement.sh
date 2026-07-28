@@ -16,10 +16,20 @@ else
 fi
 
 PACKAGES=(
+  bonnie++
+  build-essential
   cifs-utils
+  cmake
   coreutils
+  curl
+  dosfstools
+  e2fsprogs
+  exfatprogs
   ffmpeg
+  freeglut3-dev
   git
+  gir1.2-gstreamer-1.0
+  glmark2
   gstreamer1.0-libav
   gstreamer1.0-plugins-bad
   gstreamer1.0-plugins-base
@@ -28,40 +38,89 @@ PACKAGES=(
   gstreamer1.0-tools
   iperf
   iperf3
+  libfreeimage-dev
+  libgl1-mesa-dev
+  libglfw3-dev
+  libglib2.0-bin
+  libglu1-mesa-dev
+  libopenmpi-dev
+  libvulkan-dev
+  lsb-release
+  lshw
+  memtester
+  mesa-utils
   mtr-tiny
   net-tools
   network-manager
   nvme-cli
+  openmpi-bin
   openssh-client
+  pciutils
+  pkg-config
   procps
   python3
+  python3-gi
   python3-matplotlib
+  python3-numpy
+  python3-onnx
+  python3-pandas
+  python3-pip
   sshpass
   sysbench
   usbutils
   util-linux
+  vulkan-tools
   wget
+  wmctrl
   wput
+  x11-xserver-utils
+  xdotool
+)
+
+# Intentionally not installed here.  These NVIDIA SDK/meta packages are large
+# and remain the responsibility of their dedicated test/preparation scripts.
+EXCLUDED_LARGE_PACKAGES=(
+  nvidia-jetpack
+  nvidia-l4t-dla-compiler
+  libcudla-12-6
+  tensorrt
 )
 
 REQUIRED_COMMANDS=(
+  bon_csv2html
+  bonnie++
+  cmake
+  curl
   dd
   ffplay
   ffprobe
   findmnt
+  fsck
+  fsck.exfat
+  fsck.vfat
+  gdbus
   git
+  glmark2
+  glxgears
+  glxinfo
+  gsettings
   gst-launch-1.0
   gst-play-1.0
   hwclock
   ifconfig
   iperf
   iperf3
+  lshw
   lsblk
+  lspci
   lsusb
+  make
+  memtester
   mount.cifs
   mtr
   nmcli
   nvme
+  pkg-config
   python3
   sftp
   ssh
@@ -71,8 +130,12 @@ REQUIRED_COMMANDS=(
   sysctl
   timedatectl
   timeout
+  vulkaninfo
   wget
+  wmctrl
   wput
+  xdotool
+  xrandr
 )
 
 JETSON_COMMANDS=(
@@ -146,12 +209,21 @@ verify_commands() {
     done
   fi
 
-  if python3 -c 'import matplotlib' >/dev/null 2>&1; then
-    printf '%s[OK]     Python matplotlib available%s\n' "${COLOR_OK}" "${COLOR_RESET}"
-  else
-    printf '%s[MISSING] Python matplotlib%s\n' "${COLOR_ERROR}" "${COLOR_RESET}"
-    missing=1
-  fi
+  for python_module in gi matplotlib numpy onnx pandas; do
+    if python3 -c "import ${python_module}" >/dev/null 2>&1; then
+      printf '%s[OK]     Python %-15s available%s\n' \
+        "${COLOR_OK}" "${python_module}" "${COLOR_RESET}"
+    else
+      printf '%s[MISSING] Python %s%s\n' \
+        "${COLOR_ERROR}" "${python_module}" "${COLOR_RESET}"
+      missing=1
+    fi
+  done
+
+  echo
+  printf '%s=== Deliberately excluded large packages ===%s\n' \
+    "${COLOR_TITLE}" "${COLOR_RESET}"
+  printf '  %s\n' "${EXCLUDED_LARGE_PACKAGES[@]}"
 
   echo
   if [[ "${missing}" -eq 0 ]]; then

@@ -26,7 +26,7 @@ AUTORUN_SERVICE="run-3-2-power-mode-resume.service"
 AUTORUN_DESKTOP="${HOME}/.config/autostart/run-3-2-power-mode-resume.desktop"
 AUTORUN_TERMINAL_SCRIPT="${HOME}/.local/bin/run_3_2_power_mode_resume_terminal.sh"
 POWER_LIST_CMD="awk -F'[= ]' '/^< POWER_MODEL/{print \$4,\$6}' /etc/nvpmodel.conf"
-FREQ_CMD="sudo jetson_clocks --show | awk '/^cpu/&&/Online=1/||/^GPU|^EMC/{for(i=1;i<=NF;i++)if(\$i~/^MaxFreq=/)print \$1,\$i}'"
+FREQ_CMD="sudo jetson_clocks --show | awk '/^cpu[0-9]+:|^GPU |^EMC /{for(i=1;i<=NF;i++)if(\$i~/^MaxFreq=/)print \$1,\$i}'"
 
 mkdir -p "${STATE_DIR}"
 
@@ -120,7 +120,7 @@ print_freq_info() {
   else
     sudo -n jetson_clocks --show 2>&1
   fi |
-    awk '/^cpu/&&/Online=1/||/^GPU|^EMC/{for(i=1;i<=NF;i++)if($i~/^MaxFreq=/)print $1,$i}'
+    awk '/^cpu[0-9]+:|^GPU |^EMC /{for(i=1;i<=NF;i++)if($i~/^MaxFreq=/)print $1,$i}'
 }
 
 read_model() {
@@ -585,6 +585,10 @@ main() {
 
       if [[ "$(get_current_mode_id || true)" == "${mode_id}" ]]; then
         if append_current_mode_record "${mode_id}" "${mode_name}" "recorded-current-or-after-reboot"; then
+          if ! mode_recorded "${mode_id}"; then
+            printf '%sRESULT,POWER_MODE,%s_%s,FAIL,incomplete-frequency-record%s\n' "${RED}" "${mode_id}" "${mode_name}" "${RESET}"
+            die "Power mode changed, but CPU/GPU/EMC frequency data was incomplete. Refusing to repeat indefinitely."
+          fi
           progress_made=1
           printf '%sRESULT,POWER_MODE,%s_%s,PASS%s\n' "${GREEN}" "${mode_id}" "${mode_name}" "${RESET}"
           save_state "$(first_unrecorded_index)" "${MODE_IDS[*]}" "${LOG_DIR}"
@@ -604,6 +608,10 @@ main() {
       fi
 
       if append_current_mode_record "${mode_id}" "${mode_name}" "recorded-after-switch"; then
+        if ! mode_recorded "${mode_id}"; then
+          printf '%sRESULT,POWER_MODE,%s_%s,FAIL,incomplete-frequency-record%s\n' "${RED}" "${mode_id}" "${mode_name}" "${RESET}"
+          die "Power mode changed, but CPU/GPU/EMC frequency data was incomplete. Refusing to repeat indefinitely."
+        fi
         progress_made=1
         printf '%sRESULT,POWER_MODE,%s_%s,PASS%s\n' "${GREEN}" "${mode_id}" "${mode_name}" "${RESET}"
         save_state "$(first_unrecorded_index)" "${MODE_IDS[*]}" "${LOG_DIR}"

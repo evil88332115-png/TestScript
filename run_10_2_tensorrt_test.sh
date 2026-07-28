@@ -159,39 +159,30 @@ draw_temperature_curve() {
 }
 
 ensure_python_onnx() {
-  local answer
-
   if python3 -c "import onnx" >/dev/null 2>&1; then
     echo "Python onnx module found."
     return 0
   fi
 
-  if ! python3 -m pip --version >/dev/null 2>&1; then
-    warn "WARNING: python3 pip module not found."
-    echo "Suggested install command:"
-    echo "  sudo apt-get install -y python3-pip"
-    read -r -p "Install python3-pip now? [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      sudo apt-get update
-      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
-    fi
-  fi
-
-  if ! python3 -m pip --version >/dev/null 2>&1; then
-    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL,pip-not-found"
+  # Ubuntu 24.04 implements PEP 668 and rejects pip --user against the
+  # externally-managed system Python.  Use the distro package on both R36 and
+  # R39 so all later `python3` calls import ONNX from the same interpreter.
+  if ! apt-cache show python3-onnx >/dev/null 2>&1; then
+    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL,apt-package-not-found"
     return 1
   fi
 
-  echo "Python onnx module not found. Installing with pip --user..."
-  if ! python3 -m pip install --user onnx; then
-    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL,pip-install-failed"
+  echo "Python onnx module not found. Installing Ubuntu package python3-onnx..."
+  sudo apt-get update
+  if ! sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y python3-onnx; then
+    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL,apt-install-failed"
     return 1
   fi
 
   if python3 -c "import onnx" >/dev/null 2>&1; then
-    pass "RESULT,TENSORRT,ONNX_MODULE,PASS"
+    pass "RESULT,TENSORRT,ONNX_MODULE,PASS,source=apt"
   else
-    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL"
+    fail "RESULT,TENSORRT,ONNX_MODULE,FAIL,import-after-apt-install"
     return 1
   fi
 }
@@ -217,54 +208,30 @@ check_requirements() {
 }
 
 check_nvdla_compiler() {
-  local answer
-  local nvidia_lib_dir="/usr/lib/aarch64-linux-gnu/nvidia"
-  local cuda_lib_dir="/usr/local/cuda-12.6/targets/aarch64-linux/lib"
-  local missing_packages=()
+  local model lower_model
 
-  if ! find /usr /lib /opt -name 'libnvdla_compiler.so*' 2>/dev/null | grep -q .; then
-    missing_packages+=("nvidia-l4t-dla-compiler")
+  model="$(tr -d '\000' </proc/device-tree/model 2>/dev/null || true)"
+  lower_model="${model,,}"
+
+  # Orin Nano has no DLA.  This script runs trtexec on the GPU and never passes
+  # --useDLACore, so DLA libraries must not block the TensorRT GPU benchmark.
+  if [[ "$lower_model" == *"orin nano"* ]]; then
+    echo "DLA runtime check skipped: $model has no DLA; TensorRT GPU testing will continue."
+    pass "RESULT,TENSORRT,DLA_RUNTIME,SKIP,no-dla-hardware"
+    return 0
   fi
 
-  if ! find /usr /lib /opt -name 'libcudla.so.1' 2>/dev/null | grep -q .; then
-    missing_packages+=("libcudla-12-6")
-  fi
-
-  if [ "${#missing_packages[@]}" -gt 0 ]; then
-    warn "WARNING: missing TensorRT/DLA runtime libraries."
-    echo "Missing package(s): ${missing_packages[*]}"
-    echo "Suggested install command:"
-    echo "  sudo apt-get install -y ${missing_packages[*]}"
-    read -r -p "Install missing package(s) now? [y/N] " answer
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      sudo apt-get update
-      sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "${missing_packages[@]}"
-    else
-      fail "RESULT,TENSORRT,DLA_RUNTIME,FAIL,missing=${missing_packages[*]}"
-      return 1
-    fi
-  fi
-
-  if ldconfig -p 2>/dev/null | grep -q 'libnvdla_compiler\.so'; then
-    echo "libnvdla_compiler found."
-  fi
-
-  if find /usr /lib /opt -name 'libnvdla_compiler.so*' 2>/dev/null | grep -q .; then
-    echo "libnvdla_compiler found."
-    if [ -f "${nvidia_lib_dir}/libnvdla_compiler.so" ]; then
-      export LD_LIBRARY_PATH="${nvidia_lib_dir}:${LD_LIBRARY_PATH:-}"
-      echo "LD_LIBRARY_PATH updated for NVIDIA libraries: ${nvidia_lib_dir}"
-    fi
-    if [ -f "${cuda_lib_dir}/libcudla.so.1" ]; then
-      export LD_LIBRARY_PATH="${cuda_lib_dir}:${LD_LIBRARY_PATH:-}"
-      echo "LD_LIBRARY_PATH updated for CUDLA libraries: ${cuda_lib_dir}"
-    fi
+  if find /usr /lib /opt -name 'libnvdla_compiler.so*' 2>/dev/null | grep -q . && \
+     find /usr /lib /opt -name 'libcudla.so*' 2>/dev/null | grep -q .; then
+    echo "Optional TensorRT/DLA runtime libraries found."
     pass "RESULT,TENSORRT,DLA_RUNTIME,PASS"
     return 0
   fi
 
-  fail "RESULT,TENSORRT,DLA_RUNTIME,FAIL,not-found"
-  return 1
+  warn "WARNING: optional DLA runtime libraries were not found."
+  warn "This test uses TensorRT GPU FP16 only, so the GPU benchmark will continue."
+  pass "RESULT,TENSORRT,DLA_RUNTIME,SKIP,optional-runtime-missing"
+  return 0
 }
 
 detect_trtexec() {
@@ -471,8 +438,13 @@ get_jetson_clocks_status() {
     return 0
   fi
 
+  # R36 lines carry an explicit Online=0/1 field; R39 (JetPack 7.2) dropped
+  # that field and only lists online cpus in the first place. Treat a
+  # missing Online= field as online so both formats are handled.
   if echo "$output" | awk '
-    /^cpu[0-9]+:/ && /Online=1/ {
+    /^cpu[0-9]+:/ {
+      online = ($0 ~ /Online=/) ? ($0 ~ /Online=1/) : 1;
+      if (!online) next;
       min=max="";
       for (i=1; i<=NF; i++) {
         if ($i ~ /^MinFreq=/) { min=$i; sub("MinFreq=", "", min) }

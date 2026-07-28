@@ -4,10 +4,9 @@ set -Eeuo pipefail
 # 10-1 LLM Benchmark
 #
 # First run installs/configures the optional JetPack package, Docker, the
-# NVIDIA container runtime and jetson-containers.  It then switches
+# NVIDIA container runtime, disk swap, and jetson-containers.  It then switches
 # the current boot to runlevel 3 without changing the default boot target or
-# disabling nvargus-daemon.  Swap is turned off only for the benchmark run.
-# No reboot is required.
+# disabling nvargus-daemon.  No reboot is required.
 #
 # Every benchmark run records tegrastats only while MLC is running, draws
 # CPU/GPU/TJ temperatures, and collects mlc.csv.
@@ -25,12 +24,26 @@ JETSON_CONTAINERS_DIR="${JETSON_CONTAINERS_DIR:-${USER_HOME}/jetson-containers}"
 DRAW_TEMP_SCRIPT="${DRAW_TEMP_SCRIPT:-${SCRIPT_DIR}/drawtempcurve_auto.py}"
 CHART_GENERATOR="${CHART_GENERATOR:-${SCRIPT_DIR}/LLMChartGenerator.exe}"
 MLC_CSV_SOURCE="${MLC_CSV_SOURCE:-}"
+SWAP_FILE="${SWAP_FILE:-/mnt/16GB.swap}"
 INSTALL_JETPACK="${INSTALL_JETPACK:-}"
 MLC_CACHE_MODE="${MLC_CACHE_MODE:-}"
 MLC_MODEL_COUNT="${MLC_MODEL_COUNT:-}"
 NAS_MOUNT_POINT="${NAS_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nas_home}}"
-NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache}"
-MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache"
+L4T_MAJOR="${L4T_MAJOR:-$(sed -n 's/^# R\([0-9]\+\).*/\1/p' /etc/nv_tegra_release 2>/dev/null | head -n 1)}"
+L4T_MAJOR="${L4T_MAJOR:-0}"
+if ((L4T_MAJOR >= 39)); then
+  NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39}"
+  NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-${NAS_MOUNT_POINT}/10-1-MLC-docker-images/mlc-r39.2-cu132-ubuntu24.04-mlc0.20-sm87-aarch64.tar.zst}"
+  MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39"
+  MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39"
+  MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2.tegra-aarch64-cu132-24.04-mlc}"
+else
+  NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache}"
+  NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-}"
+  MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache"
+  MLC_CACHE_CONTAINER="/data/models/mlc/cache"
+  MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-dustynv/mlc:0.1.4-r36.4.2}"
+fi
 TEGRATS_INTERVAL_MS="${TEGRATS_INTERVAL_MS:-1000}"
 
 TEGRATS_LOG="${OUTPUT_DIR}/tegrastats.log"
@@ -38,6 +51,8 @@ TEMP_PNG="${OUTPUT_DIR}/temperature_cpu_gpu_tj.png"
 BENCHMARK_LOG="${OUTPUT_DIR}/benchmark.log"
 MLC_CSV_DEST="${OUTPUT_DIR}/mlc.csv"
 PERFORMANCE_PNG="${OUTPUT_DIR}/10-1_llm_performance_b442_vs_official.png"
+R39_BENCHMARK_DIR="${STATE_DIR}/r39-benchmark"
+R39_BENCHMARK_SCRIPT="${R39_BENCHMARK_DIR}/benchmark.py"
 TEGRATS_PID=""
 MLC_SOURCE_PATH=""
 MLC_START_LINES=0
@@ -67,14 +82,15 @@ usage() {
   cat <<'EOF'
 Usage: run_10_1_LLMBenchmark.sh [--prepare] [--status]
 
-  --prepare  Run the package and container-runtime preparation again.
+  --prepare  Run the package, container-runtime, and swap preparation again.
   --status   Show preparation and runtime status without changing anything.
 
 Environment overrides:
   OUTPUT_DIR, JETSON_CONTAINERS_DIR, DRAW_TEMP_SCRIPT, CHART_GENERATOR,
-  MLC_CSV_SOURCE, DUT_NAME, INSTALL_JETPACK,
+  MLC_CSV_SOURCE, DUT_NAME, SWAP_FILE, INSTALL_JETPACK,
   MLC_CACHE_MODE, MLC_MODEL_COUNT,
-  NAS_MOUNT_POINT, NAS_MLC_DIR, TEGRATS_INTERVAL_MS
+  NAS_MOUNT_POINT, NAS_MLC_DIR, NAS_MLC_IMAGE_BACKUP,
+  MLC_RUNTIME_IMAGE, TEGRATS_INTERVAL_MS
 
   INSTALL_JETPACK=0  Skip the nvidia-jetpack meta package.
   INSTALL_JETPACK=1  Install the nvidia-jetpack meta package during preparation.
@@ -83,7 +99,7 @@ Environment overrides:
   MLC_CACHE_MODE=upload  Upload the retained model cache to NAS.
   MLC_CACHE_MODE=download  Restore the model cache from NAS, then run and keep it.
   MLC_MODEL_COUNT=6   Run the selected six-model benchmark set.
-  MLC_MODEL_COUNT=12  Run all 12 models from the MLC benchmark script.
+  MLC_MODEL_COUNT=12  Run the complete 12-model benchmark set.
 EOF
 }
 
@@ -245,6 +261,7 @@ install_docker_if_missing() {
 
 prepare_system() {
   ensure_sudo_auth
+  configure_disk_swap
   install_docker_if_missing
   configure_maxn_super
   touch "$PREPARED_MARKER"
@@ -300,21 +317,37 @@ switch_to_runlevel_3() {
   pass "Runlevel 3 verified: desktop GUI stopped; SSH and Docker are active."
 }
 
-disable_swap_for_benchmark() {
+configure_disk_swap() {
+  local zram_device
+
   ensure_sudo_auth
-  info "Turning off all swap for this benchmark run..."
+  info "Configuring the 16 GB disk swap: $SWAP_FILE"
 
   if systemctl list-unit-files nvzramconfig.service --no-legend 2>/dev/null | grep -q .; then
-    run_sudo systemctl stop nvzramconfig.service
+    run_sudo systemctl disable --now nvzramconfig.service
   fi
-  if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" ]]; then
-    run_sudo swapoff -a
+  while IFS= read -r zram_device; do
+    [[ -n "$zram_device" ]] || continue
+    run_sudo swapoff "$zram_device"
+  done < <(swapon --show=NAME --noheadings 2>/dev/null | awk '$1 ~ /^\/dev\/zram/ { print $1 }')
+
+  if [[ ! -f "$SWAP_FILE" ]]; then
+    run_sudo fallocate -l 16G "$SWAP_FILE"
+    run_sudo chmod 600 "$SWAP_FILE"
+    run_sudo mkswap "$SWAP_FILE"
+  elif ! run_sudo file "$SWAP_FILE" | grep -qi 'swap file'; then
+    die "$SWAP_FILE exists but is not a swap file; refusing to overwrite it."
   fi
-  if [[ -n "$(swapon --show=NAME --noheadings 2>/dev/null)" ]]; then
-    die "Swap is still active; refusing to start the no-swap benchmark."
+  if ! swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAP_FILE"; then
+    run_sudo swapon "$SWAP_FILE"
+  fi
+  if ! grep -Eq "^[[:space:]]*${SWAP_FILE//\//\\/}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+    printf '%s\n' "$SWAP_FILE  none  swap  sw  0  0" | run_sudo tee -a /etc/fstab >/dev/null
   fi
 
-  pass "No-swap mode verified: swapon reports no active swap devices."
+  swapon --show=NAME --noheadings 2>/dev/null | grep -Fxq "$SWAP_FILE" || \
+    die "The 16 GB disk swap is not active."
+  pass "NVIDIA zram is disabled and the 16 GB disk swap is active."
 }
 
 ensure_jetson_containers() {
@@ -334,6 +367,78 @@ ensure_jetson_containers() {
   else
     info "jetson-containers installation marker found; skipping install.sh."
   fi
+}
+
+ensure_zstd() {
+  command -v zstd >/dev/null 2>&1 && return 0
+
+  info "zstd is not installed; installing it to restore the R39 MLC image..."
+  ensure_sudo_auth
+  wait_for_apt_lock 300
+  run_sudo apt-get update
+  run_sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+    -o DPkg::Lock::Timeout=300 install -y zstd
+  command -v zstd >/dev/null 2>&1 || die "zstd installation failed."
+}
+
+validate_r39_mlc_image() {
+  local image="$1"
+
+  docker image inspect "$image" >/dev/null 2>&1 || return 1
+  docker run --rm --runtime nvidia "$image" python3 -c \
+    'import tvm, tvm.s_tir; import mlc_llm.model, mlc_llm.interface.jit; assert tvm.cuda().exist' \
+    >/dev/null 2>&1
+}
+
+ensure_r39_mlc_image() {
+  local candidate
+
+  ((L4T_MAJOR >= 39)) || return 0
+
+  if validate_r39_mlc_image "$MLC_RUNTIME_IMAGE"; then
+    info "R39 MLC image is already available locally: $MLC_RUNTIME_IMAGE"
+    return 0
+  fi
+  if docker image inspect "$MLC_RUNTIME_IMAGE" >/dev/null 2>&1; then
+    warn "The local R39 MLC image exists but failed TVM s_tir/MLC/CUDA validation: $MLC_RUNTIME_IMAGE"
+  fi
+
+  for candidate in \
+    mlc:r39.2.tegra-aarch64-cu132-24.04-mlc-fixed \
+    mlc:r39.2-cu132-mlc-fixed; do
+    if validate_r39_mlc_image "$candidate"; then
+      info "Using the validated R39 MLC image: $candidate"
+      docker tag "$candidate" "$MLC_RUNTIME_IMAGE"
+      validate_r39_mlc_image "$MLC_RUNTIME_IMAGE" || \
+        die "Unable to validate the retagged R39 MLC image: $MLC_RUNTIME_IMAGE"
+      pass "RESULT,MLC_IMAGE,LOCAL_RETAG,PASS,image=$MLC_RUNTIME_IMAGE"
+      return 0
+    fi
+  done
+
+  require_nas_mount
+  [[ -s "$NAS_MLC_IMAGE_BACKUP" ]] || \
+    die "R39 MLC image is missing locally and no NAS backup was found: $NAS_MLC_IMAGE_BACKUP"
+  ensure_zstd
+
+  info "Restoring the R39 MLC Docker image from NAS..."
+  info "  NAS backup: $NAS_MLC_IMAGE_BACKUP"
+  zstd --decompress --stdout "$NAS_MLC_IMAGE_BACKUP" | docker load
+
+  for candidate in \
+    "$MLC_RUNTIME_IMAGE" \
+    mlc:r39.2.tegra-aarch64-cu132-24.04-mlc-fixed \
+    mlc:r39.2-cu132-mlc-fixed; do
+    if validate_r39_mlc_image "$candidate"; then
+      if [[ "$candidate" != "$MLC_RUNTIME_IMAGE" ]]; then
+        docker tag "$candidate" "$MLC_RUNTIME_IMAGE"
+      fi
+      validate_r39_mlc_image "$MLC_RUNTIME_IMAGE" || continue
+      pass "RESULT,MLC_IMAGE,NAS_DOWNLOAD,PASS,image=$MLC_RUNTIME_IMAGE"
+      return 0
+    fi
+  done
+  die "Docker load completed, but no image passed TVM s_tir/MLC/CUDA validation."
 }
 
 select_mlc_cache_mode() {
@@ -426,20 +531,35 @@ copy_six_model_cache_with_progress() {
     '/model_lib/***'
     '/model_weights/'
     '/model_weights/hf/'
-    '/model_weights/hf/dusty-nv/'
-    '/model_weights/hf/dusty-nv/Llama-3.1-8B-Instruct-q4f16_ft-MLC/***'
-    '/model_weights/hf/dusty-nv/Llama-3.2-3B-Instruct-q4f16_ft-MLC/***'
-    '/model_weights/hf/dusty-nv/Qwen2.5-7B-Instruct-q4f16_ft-MLC/***'
-    '/model_weights/hf/dusty-nv/Phi-3.5-mini-instruct-q4f16_ft-MLC/***'
-    '/model_weights/hf/dusty-nv/SmolLM2-1.7B-Instruct-q4f16_ft-MLC/***'
-    '/model_weights/hf/mlc-ai/'
-    '/model_weights/hf/mlc-ai/gemma-2-2b-it-q4f16_1-MLC/***'
   )
   local rsync_args=(
     -aL --human-readable --info=progress2 --no-inc-recursive
     --prune-empty-dirs
   )
   local rule
+
+  if ((L4T_MAJOR >= 39)); then
+    include_rules+=(
+      '/model_weights/hf/mlc-ai/'
+      '/model_weights/hf/mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC/***'
+      '/model_weights/hf/mlc-ai/Llama-3.2-3B-Instruct-q4f16_1-MLC/***'
+      '/model_weights/hf/mlc-ai/Qwen2.5-7B-Instruct-q4f16_1-MLC/***'
+      '/model_weights/hf/mlc-ai/gemma-2-2b-it-q4f16_1-MLC/***'
+      '/model_weights/hf/mlc-ai/Phi-3.5-mini-instruct-q4f16_1-MLC/***'
+      '/model_weights/hf/mlc-ai/SmolLM2-1.7B-Instruct-q4f16_1-MLC/***'
+    )
+  else
+    include_rules+=(
+      '/model_weights/hf/dusty-nv/'
+      '/model_weights/hf/dusty-nv/Llama-3.1-8B-Instruct-q4f16_ft-MLC/***'
+      '/model_weights/hf/dusty-nv/Llama-3.2-3B-Instruct-q4f16_ft-MLC/***'
+      '/model_weights/hf/dusty-nv/Qwen2.5-7B-Instruct-q4f16_ft-MLC/***'
+      '/model_weights/hf/dusty-nv/Phi-3.5-mini-instruct-q4f16_ft-MLC/***'
+      '/model_weights/hf/dusty-nv/SmolLM2-1.7B-Instruct-q4f16_ft-MLC/***'
+      '/model_weights/hf/mlc-ai/'
+      '/model_weights/hf/mlc-ai/gemma-2-2b-it-q4f16_1-MLC/***'
+    )
+  fi
 
   for rule in "${include_rules[@]}"; do
     rsync_args+=("--include=$rule")
@@ -498,17 +618,17 @@ make_keep_models_benchmark_copy() {
   local source_script="$1" destination_script="$2"
 
   sed \
-    -e 's|python3 benchmark.py|MLC_LLM_HOME=/data/models/mlc/cache python3 benchmark.py|' \
+    -e "s|python3 benchmark.py|MLC_LLM_HOME=${MLC_CACHE_CONTAINER} python3 benchmark.py|" \
     -e '/rm -rf \/data\/models\/mlc\/cache\/\* || true/d' \
     "$source_script" > "$destination_script"
 
-  grep -q 'MLC_LLM_HOME=/data/models/mlc/cache python3 benchmark.py' "$destination_script" || \
+  grep -q "MLC_LLM_HOME=${MLC_CACHE_CONTAINER} python3 benchmark.py" "$destination_script" || \
     die "Unable to enable the persistent MLC model cache in the benchmark copy."
   if grep -q 'rm -rf /data/models/mlc/cache' "$destination_script"; then
     die "The keep-models benchmark copy still contains a cache removal command."
   fi
   chmod +x "$destination_script"
-  info "Keeping MLC weights and JIT libraries under: $JETSON_CONTAINERS_DIR/data/models/mlc/cache"
+  info "Keeping MLC weights and JIT libraries under: $MLC_CACHE_DIR"
 }
 
 start_tegrastats() {
@@ -657,8 +777,92 @@ draw_llm_performance_chart() {
   [[ -s "$PERFORMANCE_PNG" ]]
 }
 
+make_r39_benchmark_copy() {
+  local source_script="$1"
+
+  mkdir -p "$R39_BENCHMARK_DIR"
+  sed \
+    '/stream_options={"include_usage": True},/a\        extra_body={"debug_config": {"ignore_eos": True}},' \
+    "$source_script" > "$R39_BENCHMARK_SCRIPT"
+  grep -q 'extra_body={"debug_config": {"ignore_eos": True}}' "$R39_BENCHMARK_SCRIPT" || \
+    die "Unable to enable fixed-length generation in the R39 benchmark copy."
+}
+
+run_r39_mlc_model() {
+  local model_name="$1" max_context_len="${2:-}" prefill_chunk_size="${3:-}"
+
+  info "R39 MLC model: $model_name (context=$max_context_len, prefill=$prefill_chunk_size)"
+  docker run --runtime nvidia --rm --network host --privileged --shm-size=8g \
+    --env NVIDIA_DRIVER_CAPABILITIES=all \
+    --env MLC_MODEL_ID="HF://mlc-ai/${model_name}-q4f16_1-MLC" \
+    --env MLC_CACHE_HOME="$MLC_CACHE_CONTAINER" \
+    --env MLC_CACHE_MODE="$MLC_CACHE_MODE" \
+    --env MAX_CONTEXT_LEN="$max_context_len" \
+    --env PREFILL_CHUNK_SIZE="$prefill_chunk_size" \
+    --env MAX_NUM_PROMPTS=4 \
+    --env PROMPT=/data/prompts/completion_16.json \
+    --env OUTPUT_CSV=/data/benchmarks/mlc.csv \
+    --volume "$JETSON_CONTAINERS_DIR/data:/data" \
+    --volume "$JETSON_CONTAINERS_DIR/packages/llm/mlc:/test" \
+    --volume "$R39_BENCHMARK_DIR:/r39-benchmark:ro" \
+    --workdir /test \
+    "$MLC_RUNTIME_IMAGE" \
+    /bin/bash -c '
+      args=(
+        --model "$MLC_MODEL_ID"
+        --max-new-tokens 128
+        --max-num-prompts "$MAX_NUM_PROMPTS"
+        --prompt "$PROMPT"
+        --save "$OUTPUT_CSV"
+      )
+      [[ -z "$MAX_CONTEXT_LEN" ]] || args+=(--max-context-len "$MAX_CONTEXT_LEN")
+      [[ -z "$PREFILL_CHUNK_SIZE" ]] || args+=(--prefill-chunk-size "$PREFILL_CHUNK_SIZE")
+      MLC_LLM_HOME="$MLC_CACHE_HOME" python3 /r39-benchmark/benchmark.py "${args[@]}"
+      benchmark_rc=$?
+      if [[ "$MLC_CACHE_MODE" == "remove" ]]; then
+        rm -rf -- "$MLC_CACHE_HOME"/*
+      fi
+      exit "$benchmark_rc"
+    '
+}
+
 run_selected_mlc_models() {
   local benchmark_script="$1"
+
+  if ((L4T_MAJOR >= 39)); then
+    docker image inspect "$MLC_RUNTIME_IMAGE" >/dev/null 2>&1 || \
+      die "R39 MLC image is missing: $MLC_RUNTIME_IMAGE"
+    make_r39_benchmark_copy "$JETSON_CONTAINERS_DIR/packages/llm/mlc/benchmark.py"
+
+    # Match the effective context/prefill values used by NVIDIA's R36
+    # benchmark.sh and the q4f16_ft model configs.  These intentionally remain
+    # large even when R39/MLC 0.20 needs more memory, so cross-version runs do
+    # not silently use different benchmark parameters.
+    if [[ "$MLC_MODEL_COUNT" == "12" ]]; then
+      # Match NVIDIA's R36 benchmark.sh default 12-model set and ordering.
+      run_r39_mlc_model Llama-3.2-1B-Instruct 131072 8192 || return $?
+      run_r39_mlc_model Llama-3.2-3B-Instruct 131072 8192 || return $?
+      run_r39_mlc_model Llama-3.1-8B-Instruct 131072 8192 || return $?
+      run_r39_mlc_model Llama-2-7b-chat-hf 4096 4096 || return $?
+      run_r39_mlc_model Qwen2.5-0.5B-Instruct 4096 4096 || return $?
+      run_r39_mlc_model Qwen2.5-1.5B-Instruct 4096 4096 || return $?
+      run_r39_mlc_model Qwen2.5-7B-Instruct 2048 1024 || return $?
+      run_r39_mlc_model gemma-2-2b-it 4096 2048 || return $?
+      run_r39_mlc_model Phi-3.5-mini-instruct 131072 8192 || return $?
+      run_r39_mlc_model SmolLM2-135M-Instruct 8192 8192 || return $?
+      run_r39_mlc_model SmolLM2-360M-Instruct 8192 8192 || return $?
+      run_r39_mlc_model SmolLM2-1.7B-Instruct 8192 8192 || return $?
+      return
+    fi
+
+    run_r39_mlc_model Llama-3.1-8B-Instruct 131072 8192 || return $?
+    run_r39_mlc_model Llama-3.2-3B-Instruct 131072 8192 || return $?
+    run_r39_mlc_model Qwen2.5-7B-Instruct 2048 1024 || return $?
+    run_r39_mlc_model gemma-2-2b-it 4096 2048 || return $?
+    run_r39_mlc_model Phi-3.5-mini-instruct 131072 8192 || return $?
+    run_r39_mlc_model SmolLM2-1.7B-Instruct 8192 8192 || return $?
+    return
+  fi
 
   if [[ "$MLC_MODEL_COUNT" == "12" ]]; then
     # With no model arguments, NVIDIA's benchmark.sh runs its default 12 models.
@@ -709,7 +913,7 @@ run_benchmark() {
   fi
 
   switch_to_runlevel_3
-  disable_swap_for_benchmark
+  configure_disk_swap
   rm -f "$TEMP_PNG" "$MLC_CSV_DEST" "$PERFORMANCE_PNG"
   : > "$BENCHMARK_LOG"
   configure_maxn_super
@@ -785,6 +989,7 @@ main() {
   verify_runtime
   ensure_docker_group_access
   ensure_jetson_containers
+  ensure_r39_mlc_image
   run_benchmark
 }
 
