@@ -370,6 +370,47 @@ apply_and_verify_power_caps() {
   info "Live 15W caps verified: GPU=$actual_gpu EMC=$actual_emc CPU=$actual_cpu Hz"
 }
 
+print_decode_comparison() {
+  local results_csv="$RUN_DIR/benchmark-results.csv"
+  [[ -s "$results_csv" ]] || return 0
+
+  printf '\n=== Decode Throughput vs NVIDIA v0.9.0 (Jetson Orin Nano 8GB) ===\n'
+  python3 - "$results_csv" <<'PY'
+import csv
+import sys
+
+official_decode = {
+    ("Qwen3-0.6B", "Vanilla"): 72.8,
+    ("Qwen3-1.7B", "Vanilla"): 37.4,
+    ("Qwen3-1.7B", "EAGLE3"): 41.2,
+    ("Qwen3-VL-2B-Instruct", "Vanilla"): 36.9,
+    ("Qwen3.5-0.8B", "Vanilla"): 55.3,
+    ("Qwen3.5-0.8B", "MTP"): 45.0,
+    ("Qwen3.5-0.8B-LLM", "Vanilla"): 55.4,
+    ("Qwen3.5-2B", "Vanilla"): 29.9,
+    ("Qwen3.5-2B-LLM", "Vanilla"): 30.0,
+}
+
+with open(sys.argv[1], newline="", encoding="utf-8") as csv_file:
+    rows = list(csv.DictReader(csv_file))
+
+print(f"{'Model':<26} {'Mode':<8} {'Yours':>9} {'NVIDIA':>9} {'Diff':>9}")
+print("-" * 65)
+for row in rows:
+    key = (row.get("Model", ""), row.get("Mode", ""))
+    reference = official_decode.get(key)
+    if reference is None:
+        continue
+    try:
+        measured = float(row["Generation (tok/s)"].replace(",", ""))
+    except (KeyError, TypeError, ValueError):
+        continue
+    difference = (measured / reference - 1.0) * 100.0
+    print(f"{key[0]:<26} {key[1]:<8} {measured:>8.1f} {reference:>8.1f} {difference:>+8.1f}%")
+PY
+  printf '%s\n' 'EAGLE3/MTP Decode = accepted-token throughput; all other rows = generated-token throughput.'
+}
+
 main() {
   select_models "$@"
   platform_check
@@ -403,6 +444,7 @@ main() {
   else
     info "NAS result upload disabled (UPLOAD_RESULTS=$UPLOAD_RESULTS)"
   fi
+  print_decode_comparison
   info "COMPLETE: $RUN_DIR"
   printf 'Markdown table: %s\nCSV: %s\n' "$RUN_DIR/benchmark-results.md" "$RUN_DIR/benchmark-results.csv"
 }
