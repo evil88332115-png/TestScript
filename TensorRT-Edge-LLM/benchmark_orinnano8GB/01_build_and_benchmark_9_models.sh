@@ -25,6 +25,9 @@ UPLOAD_RESULTS="${UPLOAD_RESULTS:-0}"
 NVME_GUARD="${NVME_GUARD:-0}"
 NVP_MODE_ID="${NVP_MODE_ID:-0}"
 NVP_MODE_NAME="${NVP_MODE_NAME:-15W}"
+# Set to 0 when benchmarking the JetPack Super-image 15W mode at its native
+# clocks.  The default reproduces the 612/2133 MHz NVIDIA comparison setup.
+APPLY_15W_CAPS="${APPLY_15W_CAPS:-1}"
 # Default to the fixed 61/62-token requests used for the published Orin Nano
 # comparison table.  Use BENCHMARK_MODE=mtbench explicitly for dataset runs.
 BENCHMARK_MODE="${BENCHMARK_MODE:-fixed-shape}"
@@ -352,9 +355,9 @@ apply_and_verify_power_caps() {
   # fails at the interactive golden-context reboot prompt.  In that state
   # `nvpmodel -q` says 15W but the live clocks remain at MAXN.  Apply the
   # documented mode-0 caps directly and verify the live sysfs values.
-  # Only the NVIDIA-table 15W mode needs explicit live-clock caps.  Other
-  # valid modes (for example 25W mode 1) must skip this successfully.
-  [[ "$NVP_MODE_ID" == 0 ]] || return 0
+  # Only NVIDIA-table reproduction needs the explicit 15W live-clock caps.
+  # Super-image 15W and other valid modes skip them successfully.
+  [[ "$NVP_MODE_ID" == 0 && "$APPLY_15W_CAPS" == 1 ]] || return 0
   local gpu_path='/sys/devices/platform/17000000.gpu/devfreq_dev/max_freq'
   local emc_path='/sys/kernel/nvpmodel_clk_cap/emc'
   local cpu_path actual_gpu actual_emc actual_cpu
