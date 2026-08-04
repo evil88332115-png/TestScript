@@ -25,7 +25,9 @@ UPLOAD_RESULTS="${UPLOAD_RESULTS:-0}"
 NVME_GUARD="${NVME_GUARD:-0}"
 NVP_MODE_ID="${NVP_MODE_ID:-0}"
 NVP_MODE_NAME="${NVP_MODE_NAME:-15W}"
-BENCHMARK_MODE="${BENCHMARK_MODE:-mtbench}"
+# Default to the fixed 61/62-token requests used for the published Orin Nano
+# comparison table.  Use BENCHMARK_MODE=mtbench explicitly for dataset runs.
+BENCHMARK_MODE="${BENCHMARK_MODE:-fixed-shape}"
 SHAPE_REQUESTS="${SHAPE_REQUESTS:-20}"
 SHAPE_MAX_GENERATE_LENGTH="${SHAPE_MAX_GENERATE_LENGTH:-512}"
 VENV_PYTHON="${VENV_PYTHON:-$BENCH_ROOT/venv/bin/python}"
