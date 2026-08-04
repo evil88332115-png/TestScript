@@ -25,9 +25,9 @@ UPLOAD_RESULTS="${UPLOAD_RESULTS:-0}"
 NVME_GUARD="${NVME_GUARD:-0}"
 NVP_MODE_ID="${NVP_MODE_ID:-0}"
 NVP_MODE_NAME="${NVP_MODE_NAME:-15W}"
-# Set to 0 when benchmarking the JetPack Super-image 15W mode at its native
-# clocks.  The default reproduces the 612/2133 MHz NVIDIA comparison setup.
-APPLY_15W_CAPS="${APPLY_15W_CAPS:-1}"
+# This benchmark never writes nvpmodel or GPU/EMC/CPU clock values.
+# Set SKIP_POWER_CHECK=1 to also bypass the read-only nvpmodel verification.
+SKIP_POWER_CHECK="${SKIP_POWER_CHECK:-0}"
 # Default to the fixed 61/62-token requests used for the published Orin Nano
 # comparison table.  Use BENCHMARK_MODE=mtbench explicitly for dataset runs.
 BENCHMARK_MODE="${BENCHMARK_MODE:-fixed-shape}"
@@ -351,28 +351,7 @@ upload_results() {
 }
 
 apply_and_verify_power_caps() {
-  # JetPack 7.2 can retain the requested nvpmodel ID while its boot service
-  # fails at the interactive golden-context reboot prompt.  In that state
-  # `nvpmodel -q` says 15W but the live clocks remain at MAXN.  Apply the
-  # documented mode-0 caps directly and verify the live sysfs values.
-  # Only NVIDIA-table reproduction needs the explicit 15W live-clock caps.
-  # Super-image 15W and other valid modes skip them successfully.
-  [[ "$NVP_MODE_ID" == 0 && "$APPLY_15W_CAPS" == 1 ]] || return 0
-  local gpu_path='/sys/devices/platform/17000000.gpu/devfreq_dev/max_freq'
-  local emc_path='/sys/kernel/nvpmodel_clk_cap/emc'
-  local cpu_path actual_gpu actual_emc actual_cpu
-  printf '%s\n' "$GPU_MAX_FREQ_15W" | sudo tee "$gpu_path" >/dev/null
-  printf '%s\n' "$EMC_MAX_FREQ_15W" | sudo tee "$emc_path" >/dev/null
-  for cpu_path in /sys/devices/system/cpu/cpu[0-5]/cpufreq/scaling_max_freq; do
-    printf '%s\n' "$CPU_MAX_FREQ_15W" | sudo tee "$cpu_path" >/dev/null
-  done
-  actual_gpu="$(<"$gpu_path")"
-  actual_emc="$(<"$emc_path")"
-  actual_cpu="$(</sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)"
-  [[ "$actual_gpu" == "$GPU_MAX_FREQ_15W" ]] || die "15W GPU cap failed: $actual_gpu"
-  [[ "$actual_emc" == "$EMC_MAX_FREQ_15W" ]] || die "15W EMC cap failed: $actual_emc"
-  [[ "$actual_cpu" == "$CPU_MAX_FREQ_15W" ]] || die "15W CPU cap failed: $actual_cpu"
-  info "Live 15W caps verified: GPU=$actual_gpu EMC=$actual_emc CPU=$actual_cpu Hz"
+  info "Power settings left unchanged by benchmark script."
 }
 
 print_decode_comparison() {
@@ -424,11 +403,15 @@ main() {
   storage_preflight
   export EDGELLM_PLUGIN_PATH="$PLUGIN"
   export LD_LIBRARY_PATH="$BUILD_DIR:${LD_LIBRARY_PATH:-}"
-  local power_mode
-  power_mode="$(nvpmodel -q)"
-  [[ "$power_mode" == *"$NVP_MODE_NAME"* && "$(printf '%s\n' "$power_mode" | tail -n 1)" == "$NVP_MODE_ID" ]] \
-    || die "Expected power mode $NVP_MODE_NAME ($NVP_MODE_ID), detected: $power_mode. Run 'sudo nvpmodel -m $NVP_MODE_ID', reboot when requested, then retry."
-  info "Power mode verified: $NVP_MODE_NAME ($NVP_MODE_ID)"
+  if [[ "$SKIP_POWER_CHECK" == 1 ]]; then
+    info "Power mode check skipped (SKIP_POWER_CHECK=1)."
+  else
+    local power_mode
+    power_mode="$(nvpmodel -q)"
+    [[ "$power_mode" == *"$NVP_MODE_NAME"* && "$(printf '%s\n' "$power_mode" | tail -n 1)" == "$NVP_MODE_ID" ]] \
+      || die "Expected power mode $NVP_MODE_NAME ($NVP_MODE_ID), detected: $power_mode. Set SKIP_POWER_CHECK=1 to bypass this check."
+    info "Power mode verified: $NVP_MODE_NAME ($NVP_MODE_ID)"
+  fi
   apply_and_verify_power_caps
   record_environment
   local id model_dir engine
