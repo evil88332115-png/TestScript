@@ -352,7 +352,9 @@ apply_and_verify_power_caps() {
   # fails at the interactive golden-context reboot prompt.  In that state
   # `nvpmodel -q` says 15W but the live clocks remain at MAXN.  Apply the
   # documented mode-0 caps directly and verify the live sysfs values.
-  [[ "$NVP_MODE_ID" == 0 ]] || return
+  # Only the NVIDIA-table 15W mode needs explicit live-clock caps.  Other
+  # valid modes (for example 25W mode 1) must skip this successfully.
+  [[ "$NVP_MODE_ID" == 0 ]] || return 0
   local gpu_path='/sys/devices/platform/17000000.gpu/devfreq_dev/max_freq'
   local emc_path='/sys/kernel/nvpmodel_clk_cap/emc'
   local cpu_path actual_gpu actual_emc actual_cpu
