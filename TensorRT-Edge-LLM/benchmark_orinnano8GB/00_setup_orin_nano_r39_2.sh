@@ -26,6 +26,7 @@ NVP_MODE_ID="${NVP_MODE_ID:-0}"
 NVP_MODE_NAME="${NVP_MODE_NAME:-15W}"
 RUNTIME_SOURCE="${RUNTIME_SOURCE:-ask}"
 DATASET_SOURCE="${DATASET_SOURCE:-ask}"
+ENGINE_SOURCE="${ENGINE_SOURCE:-ask}"
 PUBLISH_SETUP_CACHE="${PUBLISH_SETUP_CACHE:-1}"
 CACHE_HELPER="${CACHE_HELPER:-$SCRIPT_DIR/edgellm_setup_cache_orinnano.sh}"
 
@@ -258,6 +259,36 @@ prepare_datasets() {
   deactivate
 }
 
+prepare_engines() {
+  local source="$ENGINE_SOURCE" choice
+  [[ -x "$CACHE_HELPER" ]] || die "Cache helper is missing or not executable: $CACHE_HELPER"
+  if cache_helper check-engines; then
+    info "Reusing the complete local Orin engine cache; no download needed."
+    return
+  fi
+  if [[ "$source" == ask ]]; then
+    if [[ -t 0 ]]; then
+      printf '\nEngine source:\n  1) verified NAS engine cache (about 18GB)\n  2) skip; let item 01 build engines\n'
+      read -r -p 'Choose [1/2]: ' choice
+      [[ "$choice" == 1 ]] && source=nas || source=skip
+    else
+      source=auto
+    fi
+  fi
+  case "$source" in
+    auto)
+      if cache_helper engines-compatible; then
+        cache_helper restore-engines
+      else
+        info 'No complete compatible NAS engine cache; item 01 will build engines as needed.'
+      fi
+      ;;
+    nas) cache_helper restore-engines ;;
+    skip) info 'Engine download skipped; item 01 will build engines as needed.' ;;
+    *) die "ENGINE_SOURCE must be auto, nas, skip, or ask; received: $source" ;;
+  esac
+}
+
 prepare_benchmark_python() {
   info "Preparing fixed-token benchmark helper"
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
@@ -332,6 +363,7 @@ main() {
   configure_nas
   prepare_repo
   prepare_runtime
+  prepare_engines
   prepare_datasets
   prepare_benchmark_python
   if [[ "$PUBLISH_SETUP_CACHE" == 1 ]]; then cache_helper publish; fi

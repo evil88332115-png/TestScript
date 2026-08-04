@@ -10,9 +10,11 @@ REPO_DIR="${REPO_DIR:-$HOME/edgellm-src-v0.9.0}"
 BUILD_DIR="${BUILD_DIR:-$REPO_DIR/build-orin-r39.2-v0.9.0}"
 BENCH_ROOT="${BENCH_ROOT:-$HOME/edgellm-benchmark}"
 DATASET_DIR="${DATASET_DIR:-$BENCH_ROOT/datasets}"
+LOCAL_MODEL_ROOT="${LOCAL_MODEL_ROOT:-$BENCH_ROOT/models}"
 NAS_MOUNT="${NAS_MOUNT:-/mnt/nas_home}"
 NAS_MODEL_ROOT="${NAS_MODEL_ROOT:-$NAS_MOUNT/10-1-TensorRT-Edge-LLM-models/Orin-Nano-8GB/JetPack-7.2_R39.2/v0.9.0}"
 CACHE_DIR="${SETUP_CACHE_DIR:-$NAS_MODEL_ROOT/setup-cache/orin-nano-8gb-sm87-r39.2-v0.9.0}"
+ENGINE_CACHE_DIR="${ENGINE_CACHE_DIR:-$NAS_MODEL_ROOT/engine-cache/orin-nano-8gb-r39.2-v0.9.0}"
 EDGE_COMMIT='1ac0f2b99642045125e1c5ac7b109434ba3b36c7'
 EXPECTED_HOME='/home/p'
 
@@ -49,6 +51,17 @@ datasets_valid() {
   [[ -s "$DATASET_DIR/mtbench/mtbench_dataset.json" \
     && -s "$DATASET_DIR/coco/dataset.json" \
     && "$(find "$DATASET_DIR/coco/images" -maxdepth 1 -type f 2>/dev/null | wc -l)" -eq 5000 ]]
+}
+
+engines_valid() {
+  [[ -d "$LOCAL_MODEL_ROOT" ]] || return 1
+  [[ "$(find "$LOCAL_MODEL_ROOT" -path '*/engine/*' -type f -name '*.engine' 2>/dev/null | wc -l)" -eq 15 ]]
+}
+
+engine_cache_compatible() {
+  collect_environment
+  [[ -d "$ENGINE_CACHE_DIR/models" ]] || return 1
+  [[ "$(find "$ENGINE_CACHE_DIR/models" -path '*/engine/*' -type f -name '*.engine' 2>/dev/null | wc -l)" -eq 15 ]]
 }
 
 manifest_matches() {
@@ -149,13 +162,26 @@ restore_datasets() {
   datasets_valid || die 'Restored datasets failed validation.'
 }
 
+restore_engines() {
+  engine_cache_compatible || die "No compatible complete engine cache at $ENGINE_CACHE_DIR"
+  if engines_valid; then info 'Local engine cache is already complete; no download needed.'; return; fi
+  [[ ! -e "$LOCAL_MODEL_ROOT" ]] || die "Refusing to overwrite incomplete model directory: $LOCAL_MODEL_ROOT"
+  info "Restoring 15 TensorRT engine plans from $ENGINE_CACHE_DIR"
+  mkdir -p "$LOCAL_MODEL_ROOT"
+  rsync -a --info=progress2 "$ENGINE_CACHE_DIR/models/" "$LOCAL_MODEL_ROOT/"
+  engines_valid || die 'Restored engine cache failed validation.'
+}
+
 case "$ACTION" in
   check) cache_valid ;;
   compatible) cache_compatible ;;
   check-runtime) collect_environment; runtime_valid ;;
   check-datasets) collect_environment; datasets_valid ;;
+  check-engines) collect_environment; engines_valid ;;
+  engines-compatible) engine_cache_compatible ;;
   publish) publish ;;
   restore-runtime) restore_runtime ;;
   restore-datasets) restore_datasets ;;
-  *) die 'Usage: edgellm_setup_cache_orinnano.sh {check|compatible|check-runtime|check-datasets|publish|restore-runtime|restore-datasets}' ;;
+  restore-engines) restore_engines ;;
+  *) die 'Usage: edgellm_setup_cache_orinnano.sh {check|compatible|check-runtime|check-datasets|check-engines|engines-compatible|publish|restore-runtime|restore-datasets|restore-engines}' ;;
 esac
