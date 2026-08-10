@@ -26,7 +26,6 @@ AUTORUN_SERVICE="run-3-2-power-mode-resume.service"
 AUTORUN_DESKTOP="${HOME}/.config/autostart/run-3-2-power-mode-resume.desktop"
 AUTORUN_TERMINAL_SCRIPT="${HOME}/.local/bin/run_3_2_power_mode_resume_terminal.sh"
 POWER_LIST_CMD="awk -F'[= ]' '/^< POWER_MODEL/{print \$4,\$6}' /etc/nvpmodel.conf"
-FREQ_CMD="sudo jetson_clocks --show | awk '/^cpu[0-9]+:|^GPU |^EMC /{for(i=1;i<=NF;i++)if(\$i~/^MaxFreq=/)print \$1,\$i}'"
 
 mkdir -p "${STATE_DIR}"
 
@@ -120,7 +119,25 @@ print_freq_info() {
   else
     sudo -n jetson_clocks --show 2>&1
   fi |
-    awk '/^cpu[0-9]+:|^GPU |^EMC /{for(i=1;i<=NF;i++)if($i~/^MaxFreq=/)print $1,$i}'
+    awk '
+      /^cpu[0-9]+:/ {
+        online = 0
+        for (i = 1; i <= NF; i++) {
+          if ($i == "Online=1") online = 1
+        }
+        if (online) {
+          for (i = 1; i <= NF; i++) {
+            if ($i ~ /^MaxFreq=/) print $1, $i
+          }
+        }
+        next
+      }
+      /^GPU |^EMC / {
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^MaxFreq=/) print $1, $i
+        }
+      }
+    '
 }
 
 read_model() {
