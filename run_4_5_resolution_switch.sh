@@ -5,8 +5,8 @@ set -euo pipefail
 # 4-5 Resolution Test
 #
 # Detect all available resolutions from the current connected display,
-# switch from largest to smallest, verify each switch, then return to
-# the largest resolution.
+# switch from largest to smallest, verify each switch, then restore the
+# original resolution and GNOME per-monitor scale.
 #
 # Requirement:
 #   xrandr
@@ -23,6 +23,7 @@ GNOME_MUTTER_SCHEMA="org.gnome.mutter"
 ORIGINAL_SCALING_FACTOR=""
 ORIGINAL_TEXT_SCALING_FACTOR=""
 ORIGINAL_EXPERIMENTAL_FEATURES=""
+ORIGINAL_MONITOR_SCALE=""
 
 if [ -t 1 ]; then
   RED="\033[31m"
@@ -90,23 +91,25 @@ list_resolutions_desc() {
 
 list_resolutions_from_mutter_desc() {
   local output="$1"
+  local state
 
   if ! command -v gdbus >/dev/null 2>&1; then
     return 1
   fi
 
-  gdbus call --session \
+  state="$(gdbus call --session \
     --dest org.gnome.Mutter.DisplayConfig \
     --object-path /org/gnome/Mutter/DisplayConfig \
-    --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2>/dev/null \
-    | python3 - "$output" "$MIN_WIDTH" "$MIN_HEIGHT" <<'PY'
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2>/dev/null)" || return 1
+  MUTTER_STATE="$state" python3 - "$output" "$MIN_WIDTH" "$MIN_HEIGHT" <<'PY'
 import re
 import sys
+import os
 
 target_output = sys.argv[1]
 min_width = int(sys.argv[2])
 min_height = int(sys.argv[3])
-text = sys.stdin.read()
+text = os.environ["MUTTER_STATE"]
 
 pattern = re.compile(
     r"\('([^']+)',\s*([0-9]+),\s*([0-9]+),\s*([0-9.]+),\s*[0-9.]+,\s*\[[^\]]*\],\s*\{([^}]*)\}\)"
@@ -154,10 +157,16 @@ list_resolutions_from_xrandr_filtered_desc() {
 switch_resolution() {
   local output="$1"
   local resolution="$2"
+  local scale="${3:-1.0}"
   echo ""
   echo "Switching ${output} to ${resolution}"
-  echo "Command: xrandr --display ${DISPLAY} --output ${output} --mode ${resolution} --scale 1x1"
-  xrandr --display "$DISPLAY" --output "$output" --mode "$resolution" --scale 1x1
+  if apply_mutter_mode_and_scale "$output" "$resolution" "$scale"; then
+    echo "Applied GNOME per-monitor scale: ${scale}"
+  else
+    warn "Could not apply the GNOME per-monitor configuration; falling back to xrandr."
+    echo "Command: xrandr --display ${DISPLAY} --output ${output} --mode ${resolution} --scale 1x1"
+    xrandr --display "$DISPLAY" --output "$output" --mode "$resolution" --scale 1x1
+  fi
   force_100_percent_scaling
 }
 
@@ -196,6 +205,94 @@ force_100_percent_scaling() {
     gsettings set "$GNOME_INTERFACE_SCHEMA" scaling-factor 1 2>/dev/null || true
     gsettings set "$GNOME_INTERFACE_SCHEMA" text-scaling-factor 1.0 2>/dev/null || true
   fi
+}
+
+# xrandr --scale controls the framebuffer transform, not the scale shown in
+# GNOME Settings.  Mutter owns that per-monitor value.  Apply its D-Bus API
+# when exactly one display is active; otherwise leave the multi-display layout
+# untouched and use the xrandr fallback above.
+get_mutter_monitor_scale() {
+  local output="$1"
+  local connected_count
+  connected_count="$(xrandr --display "$DISPLAY" | awk '/ connected/ { count++ } END { print count + 0 }')"
+  [[ "$connected_count" == "1" ]] || return 1
+
+  local state
+  state="$(gdbus call --session \
+    --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2>/dev/null)" || return 1
+  MUTTER_STATE="$state" python3 - "$output" <<'PY'
+import re
+import sys
+import os
+
+text = os.environ["MUTTER_STATE"]
+output = re.escape(sys.argv[1])
+match = re.search(
+    r"\[\((-?\d+),\s*(-?\d+),\s*([0-9.]+),\s*uint32\s+\d+,\s*"
+    r"(?:true|false),\s*\[\('" + output + r"',",
+    text,
+)
+if match:
+    print(match.group(3))
+PY
+}
+
+apply_mutter_mode_and_scale() {
+  local output="$1"
+  local resolution="$2"
+  local scale="$3"
+  local connected_count state config serial mode_id x y transform primary logical
+
+  command -v gdbus >/dev/null 2>&1 || return 1
+  connected_count="$(xrandr --display "$DISPLAY" | awk '/ connected/ { count++ } END { print count + 0 }')"
+  [[ "$connected_count" == "1" ]] || return 1
+  state="$(gdbus call --session --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.GetCurrentState 2>/dev/null)" || return 1
+
+  config="$(MUTTER_STATE="$state" python3 - "$output" "$resolution" <<'PY'
+import re
+import sys
+import os
+
+text, output, resolution = os.environ["MUTTER_STATE"], sys.argv[1], sys.argv[2]
+serial = re.search(r"uint32\s+(\d+)", text)
+logical = re.search(
+    r"\[\((-?\d+),\s*(-?\d+),\s*[0-9.]+,\s*uint32\s+(\d+),\s*"
+    r"(true|false),\s*\[\('" + re.escape(output) + r"',",
+    text,
+)
+if not (serial and logical):
+    raise SystemExit(1)
+
+want_w, want_h = map(int, resolution.split("x", 1))
+modes = []
+for mode_id, width, height, refresh, props in re.findall(
+    r"\('([^']+)',\s*(\d+),\s*(\d+),\s*([0-9.]+).*?\{([^}]*)\}\)", text
+):
+    if int(width) == want_w and int(height) == want_h:
+        priority = float(refresh)
+        priority += 100000 if "is-current" in props else 0
+        priority += 50000 if "is-preferred" in props else 0
+        modes.append((priority, mode_id))
+if not modes:
+    raise SystemExit(1)
+mode_id = max(modes)[1]
+print("\t".join((serial.group(1), mode_id, logical.group(1), logical.group(2),
+                 logical.group(3), logical.group(4))))
+PY
+)" || return 1
+
+  IFS=$'\t' read -r serial mode_id x y transform primary <<<"$config"
+  [[ -n "$serial" && -n "$mode_id" ]] || return 1
+  logical="[(${x}, ${y}, ${scale}, ${transform}, ${primary}, [('${output}', '${mode_id}', {})])]"
+  gdbus call --session \
+    --dest org.gnome.Mutter.DisplayConfig \
+    --object-path /org/gnome/Mutter/DisplayConfig \
+    --method org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig \
+    "$serial" 1 "$logical" "{}" >/dev/null
 }
 
 restore_gnome_scaling() {
@@ -246,9 +343,9 @@ confirm_visible() {
 
 handle_interrupt() {
   echo ""
-  echo "Interrupted. Returning to maximum resolution and restoring scaling..."
-  if [ -n "${OUTPUT:-}" ] && [ -n "${MAX_RESOLUTION:-}" ]; then
-    xrandr --display "$DISPLAY" --output "$OUTPUT" --mode "$MAX_RESOLUTION" 2>/dev/null || true
+  echo "Interrupted. Restoring the original resolution and scaling..."
+  if [ -n "${OUTPUT:-}" ] && [ -n "${ORIGINAL_RESOLUTION:-}" ]; then
+    switch_resolution "$OUTPUT" "$ORIGINAL_RESOLUTION" "${ORIGINAL_MONITOR_SCALE:-1.0}" || true
   fi
   restore_gnome_scaling
   exit 130
@@ -289,12 +386,14 @@ fi
 
 ORIGINAL_RESOLUTION="$(get_current_resolution "$OUTPUT")"
 MAX_RESOLUTION="${RESOLUTIONS[0]}"
+ORIGINAL_MONITOR_SCALE="$(get_mutter_monitor_scale "$OUTPUT" || true)"
 
 echo "Output: ${OUTPUT}"
 echo "Resolution source: ${MODE_SOURCE}"
 echo "Original resolution: ${ORIGINAL_RESOLUTION:-unknown}"
 echo "Original GNOME scaling-factor: ${ORIGINAL_SCALING_FACTOR:-unknown}"
 echo "Original GNOME text-scaling-factor: ${ORIGINAL_TEXT_SCALING_FACTOR:-unknown}"
+echo "Original GNOME per-monitor scale: ${ORIGINAL_MONITOR_SCALE:-unknown}"
 echo "Detected resolutions from largest to smallest:"
 for resolution in "${RESOLUTIONS[@]}"; do
   echo "  ${resolution}"
@@ -324,9 +423,9 @@ for resolution in "${RESOLUTIONS[@]}"; do
 done
 
 echo ""
-echo "Returning to maximum resolution: ${MAX_RESOLUTION}"
-if switch_resolution "$OUTPUT" "$MAX_RESOLUTION" && verify_resolution "$OUTPUT" "$MAX_RESOLUTION"; then
-  confirm_visible "$OUTPUT" "$MAX_RESOLUTION" || overall_rc=1
+echo "Returning to original resolution: ${ORIGINAL_RESOLUTION}"
+if switch_resolution "$OUTPUT" "$ORIGINAL_RESOLUTION" "${ORIGINAL_MONITOR_SCALE:-1.0}" && verify_resolution "$OUTPUT" "$ORIGINAL_RESOLUTION"; then
+  confirm_visible "$OUTPUT" "$ORIGINAL_RESOLUTION" || overall_rc=1
 else
   overall_rc=1
 fi
