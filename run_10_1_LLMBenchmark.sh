@@ -301,12 +301,16 @@ switch_to_runlevel_3() {
   local started_at elapsed
 
   ensure_sudo_auth
-  info "Switching the current boot to runlevel 3 with: sudo init 3"
-  info "This normally appears to pause for 30-60 seconds; the script will continue when it returns."
-  started_at="$(date +%s)"
-  run_sudo init 3
-  elapsed="$(( $(date +%s) - started_at ))"
-  info "Runlevel 3 switch returned after ${elapsed} seconds."
+  if systemctl is-active --quiet display-manager.service; then
+    info "Switching the current boot to runlevel 3 with: sudo init 3"
+    info "This normally appears to pause for 30-60 seconds; the script will continue when it returns."
+    started_at="$(date +%s)"
+    run_sudo init 3
+    elapsed="$(( $(date +%s) - started_at ))"
+    info "Runlevel 3 switch returned after ${elapsed} seconds."
+  else
+    info "Desktop GUI is already stopped; skipping sudo init 3."
+  fi
 
   if systemctl is-active --quiet display-manager.service; then
     die "Desktop GUI is still active after sudo init 3."
