@@ -1,4 +1,4 @@
-# MaxTestScript
+# TestScript
 
 Jetson/Ubuntu hardware validation scripts for media playback, storage, network, RTC, CPU, memory, and benchmark tests.
 
