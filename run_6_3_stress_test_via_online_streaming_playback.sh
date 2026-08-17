@@ -2,15 +2,11 @@
 set -u
 
 # ============================================================
-# 6-3 Stress Test via Online Streaming Playback
+# 6-3 Stress Test via Streaming Playback
 #
-# Flow follows play_url_hwdecode_loop.sh:
-#   1. Ask nginx server IP/host
-#   2. Ask SSH username/password
-#   3. Login server, confirm/start nginx
-#   4. Use /var/www/html/TestVideo.* as streaming source
-#   5. Play URL with hardware decode pipeline
-#   6. Print FPS/system status on one refreshing line only
+# Playback source:
+#   1. Online HTTP stream served by nginx on a remote host
+#   2. Direct playback from TestVideo.mp4 at the NAS mount root
 #
 # Test stops when the requested duration is reached.
 # Ctrl+C also stops test and still attempts to draw the temperature curve.
@@ -19,7 +15,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR" || exit 1
 
-TEST_NAME="6-3 Stress Test via Online Streaming Playback"
+TEST_NAME="6-3 Stress Test via Streaming Playback"
 ENABLE_AUDIO="${ENABLE_AUDIO:-true}"
 ENABLE_SYS_STATS="${ENABLE_SYS_STATS:-true}"
 ENABLE_FPS="${ENABLE_FPS:-true}"
@@ -40,6 +36,9 @@ SERVER_USER=""
 SERVER_PASS=""
 VIDEO_BASENAME=""
 URL=""
+PLAYBACK_SOURCE_MODE="${PLAYBACK_SOURCE_MODE:-}"
+NAS_VIDEO="${NAS_VIDEO:-/mnt/nas_home/TestVideo.mp4}"
+PLAYBACK_SOURCE=""
 VIDEO_CODEC=""
 AUDIO_CODEC=""
 FORMAT_NAME=""
@@ -126,7 +125,9 @@ finish_test() {
             echo "Host: $(hostname)"
             echo "Date finished: $(date -Iseconds)"
             echo "Server: $SERVER_HOST"
-            echo "URL: $URL"
+            echo "Playback source mode: $PLAYBACK_SOURCE_MODE"
+            echo "Playback source: $PLAYBACK_SOURCE"
+            echo "URI: $URL"
             echo "Duration seconds: $TEST_DURATION_SECONDS"
             echo "Average interval minutes: $AVG_INTERVAL_MIN"
             echo "Video codec: $VIDEO_CODEC"
@@ -487,6 +488,52 @@ REMOTE_FIND
     return 1
 }
 
+select_playback_source() {
+    local choice
+
+    if [ -n "$PLAYBACK_SOURCE_MODE" ]; then
+        case "$PLAYBACK_SOURCE_MODE" in
+            online|http|nginx) PLAYBACK_SOURCE_MODE="online" ;;
+            nas|nas_direct|local) PLAYBACK_SOURCE_MODE="nas" ;;
+            *)
+                echo "ERROR: unsupported PLAYBACK_SOURCE_MODE=$PLAYBACK_SOURCE_MODE. Use online or nas."
+                return 1
+                ;;
+        esac
+    elif [ ! -t 0 ]; then
+        PLAYBACK_SOURCE_MODE="online"
+        echo "Non-interactive shell; defaulting playback source to online nginx streaming."
+    else
+        echo ""
+        echo "Playback source:"
+        echo "1) Online HTTP streaming via nginx (existing test flow)"
+        echo "2) Direct NAS playback: $NAS_VIDEO"
+        read -rp "Select [1/2, default 1]: " choice
+        case "$choice" in
+            2) PLAYBACK_SOURCE_MODE="nas" ;;
+            *) PLAYBACK_SOURCE_MODE="online" ;;
+        esac
+    fi
+
+    case "$PLAYBACK_SOURCE_MODE" in
+        online)
+            echo "Playback source: online HTTP streaming"
+            ;;
+        nas)
+            if [ ! -f "$NAS_VIDEO" ]; then
+                echo "ERROR: NAS video not found: $NAS_VIDEO"
+                echo "Please mount NAS first with $SCRIPT_DIR/run_0_mount_nas.sh."
+                return 1
+            fi
+            PLAYBACK_SOURCE="$NAS_VIDEO"
+            VIDEO_BASENAME="$(basename "$NAS_VIDEO")"
+            URL="file://$NAS_VIDEO"
+            echo "Playback source: direct NAS file"
+            ls -lh "$NAS_VIDEO"
+            ;;
+    esac
+}
+
 run_gst_with_one_line_status() {
     local loop_index="$1"
     shift
@@ -589,16 +636,25 @@ play_once() {
     local loop_index="$1"
     local parser demux
     local cmd
+    local -a source_parts
 
     parser="$(get_parser "$VIDEO_CODEC")"
-    demux="$(get_demux "$URL" "$FORMAT_NAME")"
+    demux="$(get_demux "$PLAYBACK_SOURCE" "$FORMAT_NAME")"
     make_sink_parts
+
+    if [ "$PLAYBACK_SOURCE_MODE" = "nas" ]; then
+        source_parts=(filesrc "location=$PLAYBACK_SOURCE" !)
+    else
+        source_parts=(souphttpsrc "location=$URL" !)
+    fi
 
     echo ""
     echo "======================================"
     echo "$TEST_NAME"
     echo "Loop index: $loop_index"
-    echo "URL: $URL"
+    echo "Source mode: $PLAYBACK_SOURCE_MODE"
+    echo "Source: $PLAYBACK_SOURCE"
+    echo "URI: $URL"
     echo "Format: $FORMAT_NAME"
     echo "Video codec: $VIDEO_CODEC"
     echo "Audio codec: $AUDIO_CODEC"
@@ -616,14 +672,14 @@ play_once() {
         if [ "$ENABLE_AUDIO" = "true" ] && [ "$AUDIO_CODEC" != "none" ] && audio_supported_for_demux "$demux"; then
             run_gst_with_one_line_status "$loop_index" \
                 gst-launch-1.0 -e \
-                souphttpsrc location="$URL" ! \
+                "${source_parts[@]}" \
                 "$demux" name=demux \
                 demux.video_0 ! queue ! "$parser" ! nvv4l2decoder ! nvvidconv ! "${SINK_PARTS[@]}" \
                 demux.audio_0 ! queue ! decodebin ! audioconvert ! audioresample ! autoaudiosink
         else
             run_gst_with_one_line_status "$loop_index" \
                 gst-launch-1.0 -e \
-                souphttpsrc location="$URL" ! \
+                "${source_parts[@]}" \
                 "$demux" name=demux demux.video_0 ! queue ! "$parser" ! nvv4l2decoder ! nvvidconv ! "${SINK_PARTS[@]}"
         fi
     else
@@ -656,27 +712,31 @@ require_cmd ffprobe || {
 }
 
 prompt_test_duration
+select_playback_source || exit 1
 
-echo ""
-echo "Video server setup"
-echo ""
-read -rp "Enter nginx server IP/host: " SERVER_HOST
-[ -n "$SERVER_HOST" ] || { echo "No server IP/host entered. Exit."; exit 1; }
-SERVER_HOST="${SERVER_HOST#http://}"
-SERVER_HOST="${SERVER_HOST#https://}"
-SERVER_HOST="${SERVER_HOST%%/*}"
+if [ "$PLAYBACK_SOURCE_MODE" = "online" ]; then
+    echo ""
+    echo "Video server setup"
+    echo ""
+    read -rp "Enter nginx server IP/host: " SERVER_HOST
+    [ -n "$SERVER_HOST" ] || { echo "No server IP/host entered. Exit."; exit 1; }
+    SERVER_HOST="${SERVER_HOST#http://}"
+    SERVER_HOST="${SERVER_HOST#https://}"
+    SERVER_HOST="${SERVER_HOST%%/*}"
 
-read -rp "Enter SSH username for $SERVER_HOST: " SERVER_USER
-[ -n "$SERVER_USER" ] || { echo "No SSH username entered. Exit."; exit 1; }
+    read -rp "Enter SSH username for $SERVER_HOST: " SERVER_USER
+    [ -n "$SERVER_USER" ] || { echo "No SSH username entered. Exit."; exit 1; }
 
-read -rsp "Enter SSH password for ${SERVER_USER}@${SERVER_HOST}: " SERVER_PASS
-echo ""
-[ -n "$SERVER_PASS" ] || { echo "No SSH password entered. Exit."; exit 1; }
+    read -rsp "Enter SSH password for ${SERVER_USER}@${SERVER_HOST}: " SERVER_PASS
+    echo ""
+    [ -n "$SERVER_PASS" ] || { echo "No SSH password entered. Exit."; exit 1; }
 
-setup_video_server || {
-    echo "ERROR: Failed to set up nginx video server."
-    exit 1
-}
+    setup_video_server || {
+        echo "ERROR: Failed to set up nginx video server."
+        exit 1
+    }
+    PLAYBACK_SOURCE="$URL"
+fi
 
 echo ""
 echo "Checking remote video codec..."

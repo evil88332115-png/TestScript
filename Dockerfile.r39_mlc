@@ -1,0 +1,84 @@
+# syntax=docker/dockerfile:1-labs
+#
+# Repair build for JetPack 7 / L4T R39 MLC.  The generic MLC package can leave
+# an image without the TVM Python module when no wheel is published for the
+# selected R39 package index.  This file uses the bundled TVM source from the
+# already-built MLC image, compiles it for Orin SM87, then builds MLC against it.
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG CUDA_ARCH=87
+ENV TVM_HOME=/opt/mlc-llm/3rdparty/tvm \
+    TVM_SOURCE_DIR=/opt/mlc-llm/3rdparty/tvm \
+    TVM_LIBRARY_PATH=/opt/mlc-llm/3rdparty/tvm/build \
+    MLC_LLM_SOURCE_DIR=/opt/mlc-llm \
+    PATH=/opt/venv/bin:${PATH}
+
+RUN --device=nvidia.com/gpu=all --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
+    set -eux; \
+    rm -rf "${TVM_HOME}/build"; \
+    cmake -S "${TVM_HOME}" -B "${TVM_HOME}/build" -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DUSE_CUDA=ON \
+      -DUSE_CUBLAS=ON \
+      -DUSE_CUDNN=ON \
+      -DUSE_LLVM=/usr/bin/llvm-config-22 \
+      -DTVM_FFI_USE_LIBBACKTRACE=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"; \
+    cmake --build "${TVM_HOME}/build" --parallel 2
+
+# TVM builds its matching TVM-FFI shared library in build/lib, while libtvm.so
+# is placed in build.  Prefer both over the older PyPI TVM-FFI inherited from
+# the generic base image so their C++ ABI stays identical.
+ENV TVM_FFI_LIBRARY_PATH=/opt/mlc-llm/3rdparty/tvm/build/lib \
+    LD_LIBRARY_PATH=/opt/mlc-llm/3rdparty/tvm/build/lib:/opt/mlc-llm/3rdparty/tvm/build:${LD_LIBRARY_PATH}
+
+RUN --device=nvidia.com/gpu=all \
+    --mount=type=secret,id=libcuda_stub,target=/run/secrets/libcuda.so \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    set -eux; \
+    install -Dm755 /run/secrets/libcuda.so /opt/cuda-stub-build/libcuda.so.1; \
+    trap 'rm -f /opt/cuda-stub-build/libcuda.so.1; rmdir /opt/cuda-stub-build' EXIT; \
+    export LD_LIBRARY_PATH="/opt/cuda-stub-build:${LD_LIBRARY_PATH:-}"; \
+    uv pip install --python /opt/venv/bin/python \
+      --index-url https://pypi.org/simple \
+      scikit-build-core cython setuptools-scm pytest; \
+    uv pip uninstall --python /opt/venv/bin/python apache-tvm-ffi; \
+    CMAKE_ARGS="-DTVM_FFI_USE_LIBBACKTRACE=OFF" \
+      uv pip install --python /opt/venv/bin/python --no-build-isolation \
+        -e "${TVM_HOME}/3rdparty/tvm-ffi"; \
+    uv pip install --python /opt/venv/bin/python --no-build-isolation -e "${TVM_HOME}"; \
+    test -f "${TVM_FFI_LIBRARY_PATH}/libtvm_ffi.so"; \
+    python3 -c 'import tvm; print("TVM Python import verified; CUDA device validation is performed at container runtime")'
+
+RUN --device=nvidia.com/gpu=all \
+    --mount=type=secret,id=libcuda_stub,target=/run/secrets/libcuda.so \
+    --mount=type=cache,target=/root/.cache/ccache,sharing=locked \
+    set -eux; \
+    install -Dm755 /run/secrets/libcuda.so /opt/cuda-stub-build/libcuda.so.1; \
+    trap 'rm -f /opt/cuda-stub-build/libcuda.so.1; rmdir /opt/cuda-stub-build' EXIT; \
+    export LD_LIBRARY_PATH="/opt/cuda-stub-build:${LD_LIBRARY_PATH:-}"; \
+    rm -rf /opt/mlc-llm/build /opt/mlc-wheels; \
+    cmake -S /opt/mlc-llm -B /opt/mlc-llm/build -G Ninja \
+      -DTVM_SOURCE_DIR="${TVM_HOME}" \
+      -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DUSE_CUDA=ON \
+      -DUSE_CUBLAS=ON \
+      -DUSE_CUTLASS=ON \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"; \
+    cmake --build /opt/mlc-llm/build --parallel 2; \
+    mkdir -p /opt/mlc-wheels; \
+    cd /opt/mlc-llm/python; \
+    python3 setup.py bdist_wheel --dist-dir /opt/mlc-wheels
+
+RUN --device=nvidia.com/gpu=all \
+    --mount=type=secret,id=libcuda_stub,target=/run/secrets/libcuda.so \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    set -eux; \
+    install -Dm755 /run/secrets/libcuda.so /opt/cuda-stub-build/libcuda.so.1; \
+    trap 'rm -f /opt/cuda-stub-build/libcuda.so.1; rmdir /opt/cuda-stub-build' EXIT; \
+    export LD_LIBRARY_PATH="/opt/cuda-stub-build:${LD_LIBRARY_PATH:-}"; \
+    uv pip install --python /opt/venv/bin/python /opt/mlc-wheels/mlc_llm*.whl; \
+    uv pip uninstall --python /opt/venv/bin/python triton; \
+    python3 -c 'import tvm, tvm.s_tir; import mlc_llm.model, mlc_llm.interface.jit; print("TVM and MLC Python imports verified (Triton disabled on R39 Orin)")'
