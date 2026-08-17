@@ -120,12 +120,43 @@ print_freq_info() {
     sudo -n jetson_clocks --show 2>&1
   fi |
     awk '
+      # R36 reports Online=1 on each cpuN line, whereas R39 reports the
+      # online set once as "Online CPUs: 0-5, Offline CPUs: ...".  Build the
+      # latter set when present so both formats exclude genuinely offline CPUs.
+      /^Online CPUs:/ {
+        online_list = $0
+        sub(/^Online CPUs:[[:space:]]*/, "", online_list)
+        sub(/,[[:space:]]*Offline CPUs:.*/, "", online_list)
+        gsub(/[[:space:]]/, "", online_list)
+        if (online_list != "") {
+          online_list_available = 1
+          count = split(online_list, ranges, ",")
+          for (r = 1; r <= count; r++) {
+            if (ranges[r] ~ /^[0-9]+-[0-9]+$/) {
+              split(ranges[r], bounds, "-")
+              for (cpu_id = bounds[1]; cpu_id <= bounds[2]; cpu_id++) {
+                online_cpu[cpu_id] = 1
+              }
+            } else if (ranges[r] ~ /^[0-9]+$/) {
+              online_cpu[ranges[r]] = 1
+            }
+          }
+        }
+        next
+      }
       /^cpu[0-9]+:/ {
-        online = 0
+        cpu_name = $1
+        sub(/:$/, "", cpu_name)
+        cpu_id = cpu_name
+        sub(/^cpu/, "", cpu_id)
+        online = -1
         for (i = 1; i <= NF; i++) {
           if ($i == "Online=1") online = 1
+          else if ($i == "Online=0") online = 0
         }
-        if (online) {
+        if (online_list_available) online = (cpu_id in online_cpu)
+        # Keep compatibility with formats that expose neither online marker.
+        if (online != 0) {
           for (i = 1; i <= NF; i++) {
             if ($i ~ /^MaxFreq=/) print $1, $i
           }

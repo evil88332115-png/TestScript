@@ -28,15 +28,38 @@ SWAP_FILE="${SWAP_FILE:-/mnt/16GB.swap}"
 INSTALL_JETPACK="${INSTALL_JETPACK:-}"
 MLC_CACHE_MODE="${MLC_CACHE_MODE:-}"
 MLC_MODEL_COUNT="${MLC_MODEL_COUNT:-}"
+MLC_ONLY_MODEL="${MLC_ONLY_MODEL:-}"
 NAS_MOUNT_POINT="${NAS_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nas_home}}"
 L4T_MAJOR="${L4T_MAJOR:-$(sed -n 's/^# R\([0-9]\+\).*/\1/p' /etc/nv_tegra_release 2>/dev/null | head -n 1)}"
 L4T_MAJOR="${L4T_MAJOR:-0}"
 if ((L4T_MAJOR >= 39)); then
-  NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39}"
-  NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-${NAS_MOUNT_POINT}/10-1-MLC-docker-images/mlc-r39.2-cu132-ubuntu24.04-mlc0.20-sm87-aarch64.tar.zst}"
-  MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39"
-  MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39"
-  MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2.tegra-aarch64-cu132-24.04-mlc}"
+  R39_MLC_STACK="${R39_MLC_STACK:-legacy}"
+  R39_MLC_DOCKERFILE="${R39_MLC_DOCKERFILE:-${SCRIPT_DIR}/Dockerfile.r39_mlc}"
+  R39_LEGACY_DOCKERFILE="${R39_LEGACY_DOCKERFILE:-${SCRIPT_DIR}/Dockerfile.r39_mlc_legacy}"
+  R39_LEGACY_BASE_IMAGE="${R39_LEGACY_BASE_IMAGE:-dustynv/mlc:0.1.4-r36.4.2}"
+  # A prebuilt archive is optional.  When it is absent, 10-1 builds the
+  # R39-compatible CUDA 13.2 / SM87 image locally.
+  NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-}"
+  case "${R39_MLC_STACK,,}" in
+    legacy|0.1.3|013)
+      R39_MLC_STACK="legacy"
+      NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39-legacy}"
+      MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39-legacy"
+      MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39-legacy"
+      MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2-legacy013}"
+      ;;
+    mlc20|0.20|current)
+      R39_MLC_STACK="mlc20"
+      NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39}"
+      MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39"
+      MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39"
+      MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2.tegra-aarch64-cu132-24.04-mlc}"
+      ;;
+    *)
+      printf 'ERROR: R39_MLC_STACK must be legacy or mlc20.\n' >&2
+      exit 1
+      ;;
+  esac
 else
   NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache}"
   NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-}"
@@ -88,7 +111,7 @@ Usage: run_10_1_LLMBenchmark.sh [--prepare] [--status]
 Environment overrides:
   OUTPUT_DIR, JETSON_CONTAINERS_DIR, DRAW_TEMP_SCRIPT, CHART_GENERATOR,
   MLC_CSV_SOURCE, DUT_NAME, SWAP_FILE, INSTALL_JETPACK,
-  MLC_CACHE_MODE, MLC_MODEL_COUNT,
+  MLC_CACHE_MODE, MLC_MODEL_COUNT, MLC_ONLY_MODEL, R39_MLC_STACK,
   NAS_MOUNT_POINT, NAS_MLC_DIR, NAS_MLC_IMAGE_BACKUP,
   MLC_RUNTIME_IMAGE, TEGRATS_INTERVAL_MS
 
@@ -100,6 +123,10 @@ Environment overrides:
   MLC_CACHE_MODE=download  Restore the model cache from NAS, then run and keep it.
   MLC_MODEL_COUNT=6   Run the selected six-model benchmark set.
   MLC_MODEL_COUNT=12  Run the complete 12-model benchmark set.
+  MLC_ONLY_MODEL=Llama-3.1-8B-Instruct  Run only one named R39 model for diagnosis.
+  R39_MLC_STACK=legacy  Use original MLC 0.1.3/TVM 0.18.1/q4f16_ft on R39 (default).
+  R39_MLC_STACK=mlc20   Use the rebuilt MLC 0.20/TVM 0.24/q4f16_1 image.
+  NAS_MLC_IMAGE_BACKUP=/path/image.tar.zst  Optionally restore a prebuilt R39 image.
 EOF
 }
 
@@ -390,8 +417,116 @@ validate_r39_mlc_image() {
 
   docker image inspect "$image" >/dev/null 2>&1 || return 1
   docker run --rm --runtime nvidia "$image" python3 -c \
-    'import tvm, tvm.s_tir; import mlc_llm.model, mlc_llm.interface.jit; assert tvm.cuda().exist' \
+    'import tvm; import mlc_llm.model, mlc_llm.interface.jit; assert tvm.cuda().exist' \
     >/dev/null 2>&1
+}
+
+build_r39_legacy_mlc_image() {
+  local rc
+
+  [[ -f "$R39_LEGACY_DOCKERFILE" ]] || \
+    die "R39 legacy MLC Dockerfile is missing: $R39_LEGACY_DOCKERFILE"
+  if ! docker image inspect "$R39_LEGACY_BASE_IMAGE" >/dev/null 2>&1; then
+    info "Pulling the original R36 MLC image: $R39_LEGACY_BASE_IMAGE"
+    docker pull "$R39_LEGACY_BASE_IMAGE" || \
+      die "Unable to pull the original R36 MLC image: $R39_LEGACY_BASE_IMAGE"
+  fi
+
+  info "Building the R39 legacy wrapper (MLC 0.1.3, TVM 0.18.1, q4f16_ft)..."
+  info "The wrapper keeps CUDA 12.6 SM87 code and selects the R39 runtime driver instead of CUDA compat libcuda."
+  set +e
+  docker buildx build --load --network host \
+    --tag "$MLC_RUNTIME_IMAGE" \
+    --build-arg "BASE_IMAGE=$R39_LEGACY_BASE_IMAGE" \
+    --file "$R39_LEGACY_DOCKERFILE" \
+    "$SCRIPT_DIR"
+  rc=$?
+  set -e
+  ((rc == 0)) || die "R39 legacy MLC wrapper build failed (rc=$rc)."
+  validate_r39_mlc_image "$MLC_RUNTIME_IMAGE" || \
+    die "R39 legacy MLC wrapper was built but CUDA validation failed."
+  pass "RESULT,MLC_IMAGE,LEGACY_WRAPPER,PASS,image=$MLC_RUNTIME_IMAGE"
+}
+
+patch_r39_mlc_llvm_dependency() {
+  local config="$JETSON_CONTAINERS_DIR/packages/llm/mlc/config.py"
+
+  [[ -f "$config" ]] || die "MLC package configuration is missing: $config"
+  if grep -Eq "mlc\('d1ea69a'.*version='0\.20\.0'.*llvm=22" "$config"; then
+    return 0
+  fi
+  grep -Eq "mlc\('d1ea69a'.*version='0\.20\.0'.*tvm='0\.22\.0'" "$config" || \
+    die "Unsupported MLC 0.20 package definition; cannot apply the R39 LLVM compatibility fix."
+
+  # The base R39 dependency chain already contains LLVM 22.  Requesting LLVM
+  # 20 as well makes Ubuntu's experimental libc++ packages conflict.
+  sed -i "/mlc('d1ea69a'/s/tvm='0\.22\.0', /tvm='0.22.0', llvm=22, /" "$config"
+  grep -Eq "mlc\('d1ea69a'.*version='0\.20\.0'.*llvm=22" "$config" || \
+    die "Unable to apply the R39 MLC LLVM 22 compatibility fix."
+  info "Applied R39 MLC compatibility: MLC 0.20 uses LLVM 22."
+}
+
+build_r39_mlc_image() {
+  local rc candidate generic_image="" libcuda_stub=""
+
+  [[ -x "$JETSON_CONTAINERS_DIR/jetson-containers" ]] || \
+    die "jetson-containers build command is unavailable: $JETSON_CONTAINERS_DIR/jetson-containers"
+  [[ -f "$R39_MLC_DOCKERFILE" ]] || \
+    die "R39 MLC repair Dockerfile is missing: $R39_MLC_DOCKERFILE"
+
+  for candidate in \
+    /usr/local/cuda/targets/sbsa-linux/lib/stubs/libcuda.so \
+    /usr/local/cuda-13.2/targets/sbsa-linux/lib/stubs/libcuda.so \
+    /usr/local/cuda/targets/aarch64-linux/lib/stubs/libcuda.so; do
+    if [[ -r "$candidate" ]]; then
+      libcuda_stub="$candidate"
+      break
+    fi
+  done
+  [[ -n "$libcuda_stub" ]] || \
+    die "CUDA driver stub was not found under /usr/local/cuda; it is required only during the Docker build."
+
+  info "No usable R39 MLC image was found; building the R39 base dependencies locally."
+  info "Target: CUDA 13.2, aarch64, Orin SM87, MLC 0.20"
+  info "The first build downloads and compiles dependencies and can take a long time."
+  patch_r39_mlc_llvm_dependency
+  set +e
+  (
+    cd "$JETSON_CONTAINERS_DIR"
+    CUDA_VERSION=13.2 ./jetson-containers build \
+      --name="$MLC_RUNTIME_IMAGE" \
+      --skip-tests=all \
+      --build-args "PIP_INDEX_REPO:https://pypi.org/simple,FALLBACK_PIP_INDEX_URL:https://pypi.org/simple" \
+      mlc:0.20.0
+  )
+  rc=$?
+  set -e
+  ((rc == 0)) || die "Local R39 MLC image build failed (rc=$rc)."
+
+  while IFS= read -r candidate; do
+    case "$candidate" in
+      "${MLC_RUNTIME_IMAGE}"*-mlc_0.20.0) generic_image="$candidate"; break ;;
+    esac
+  done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
+
+  [[ -n "$generic_image" ]] || \
+    die "The generic R39 MLC build completed, but its final image tag was not found."
+  info "Repairing the R39 MLC image from bundled TVM source: $generic_image"
+  info "This compiles CUDA-enabled TVM and MLC for Orin SM87; it may take a long time."
+  set +e
+  docker buildx build --load --allow device --network host --shm-size=8g \
+    --tag "$MLC_RUNTIME_IMAGE" \
+    --build-arg "BASE_IMAGE=$generic_image" \
+    --build-arg CUDA_ARCH=87 \
+    --secret "id=libcuda_stub,src=$libcuda_stub" \
+    --file "$R39_MLC_DOCKERFILE" \
+    "$SCRIPT_DIR"
+  rc=$?
+  set -e
+  ((rc == 0)) || die "R39 TVM/MLC repair build failed (rc=$rc)."
+  validate_r39_mlc_image "$MLC_RUNTIME_IMAGE" || \
+    die "R39 TVM/MLC repair image was built but CUDA validation failed."
+  pass "RESULT,MLC_IMAGE,LOCAL_BUILD,PASS,image=$MLC_RUNTIME_IMAGE"
 }
 
 ensure_r39_mlc_image() {
@@ -403,8 +538,12 @@ ensure_r39_mlc_image() {
     info "R39 MLC image is already available locally: $MLC_RUNTIME_IMAGE"
     return 0
   fi
+  if [[ "$R39_MLC_STACK" == "legacy" ]]; then
+    build_r39_legacy_mlc_image
+    return 0
+  fi
   if docker image inspect "$MLC_RUNTIME_IMAGE" >/dev/null 2>&1; then
-    warn "The local R39 MLC image exists but failed TVM s_tir/MLC/CUDA validation: $MLC_RUNTIME_IMAGE"
+    warn "The local R39 MLC image exists but failed TVM/MLC/CUDA validation: $MLC_RUNTIME_IMAGE"
   fi
 
   for candidate in \
@@ -420,29 +559,28 @@ ensure_r39_mlc_image() {
     fi
   done
 
-  require_nas_mount
-  [[ -s "$NAS_MLC_IMAGE_BACKUP" ]] || \
-    die "R39 MLC image is missing locally and no NAS backup was found: $NAS_MLC_IMAGE_BACKUP"
-  ensure_zstd
+  if [[ -n "$NAS_MLC_IMAGE_BACKUP" && -s "$NAS_MLC_IMAGE_BACKUP" ]]; then
+    ensure_zstd
+    info "Restoring the supplied R39 MLC Docker image archive..."
+    info "  Archive: $NAS_MLC_IMAGE_BACKUP"
+    zstd --decompress --stdout "$NAS_MLC_IMAGE_BACKUP" | docker load
 
-  info "Restoring the R39 MLC Docker image from NAS..."
-  info "  NAS backup: $NAS_MLC_IMAGE_BACKUP"
-  zstd --decompress --stdout "$NAS_MLC_IMAGE_BACKUP" | docker load
-
-  for candidate in \
-    "$MLC_RUNTIME_IMAGE" \
-    mlc:r39.2.tegra-aarch64-cu132-24.04-mlc-fixed \
-    mlc:r39.2-cu132-mlc-fixed; do
-    if validate_r39_mlc_image "$candidate"; then
-      if [[ "$candidate" != "$MLC_RUNTIME_IMAGE" ]]; then
-        docker tag "$candidate" "$MLC_RUNTIME_IMAGE"
+    for candidate in \
+      "$MLC_RUNTIME_IMAGE" \
+      mlc:r39.2.tegra-aarch64-cu132-24.04-mlc-fixed \
+      mlc:r39.2-cu132-mlc-fixed; do
+      if validate_r39_mlc_image "$candidate"; then
+        if [[ "$candidate" != "$MLC_RUNTIME_IMAGE" ]]; then
+          docker tag "$candidate" "$MLC_RUNTIME_IMAGE"
+        fi
+        pass "RESULT,MLC_IMAGE,ARCHIVE_RESTORE,PASS,image=$MLC_RUNTIME_IMAGE"
+        return 0
       fi
-      validate_r39_mlc_image "$MLC_RUNTIME_IMAGE" || continue
-      pass "RESULT,MLC_IMAGE,NAS_DOWNLOAD,PASS,image=$MLC_RUNTIME_IMAGE"
-      return 0
-    fi
-  done
-  die "Docker load completed, but no image passed TVM s_tir/MLC/CUDA validation."
+    done
+    warn "The supplied image archive did not contain a CUDA-valid R39 MLC image."
+  fi
+
+  build_r39_mlc_image
 }
 
 select_mlc_cache_mode() {
@@ -542,7 +680,7 @@ copy_six_model_cache_with_progress() {
   )
   local rule
 
-  if ((L4T_MAJOR >= 39)); then
+  if ((L4T_MAJOR >= 39)) && [[ "${R39_MLC_STACK:-legacy}" != "legacy" ]]; then
     include_rules+=(
       '/model_weights/hf/mlc-ai/'
       '/model_weights/hf/mlc-ai/Llama-3.1-8B-Instruct-q4f16_1-MLC/***'
@@ -790,15 +928,37 @@ make_r39_benchmark_copy() {
     "$source_script" > "$R39_BENCHMARK_SCRIPT"
   grep -q 'extra_body={"debug_config": {"ignore_eos": True}}' "$R39_BENCHMARK_SCRIPT" || \
     die "Unable to enable fixed-length generation in the R39 benchmark copy."
+  sed -i '/^import tvm$/a\
+cuda_device = tvm.cuda(0)\
+if not cuda_device.exist:\
+    raise RuntimeError("R39 benchmark requires CUDA device cuda:0; refusing CPU fallback")\
+print("MLC CUDA device verified: cuda:0")\
+' "$R39_BENCHMARK_SCRIPT"
+  grep -q 'refusing CPU fallback' "$R39_BENCHMARK_SCRIPT" || \
+    die "Unable to add the R39 CUDA device guard to the benchmark copy."
 }
 
 run_r39_mlc_model() {
   local model_name="$1" max_context_len="${2:-}" prefill_chunk_size="${3:-}"
+  local quantization="${4:-}" hf_user model_id
 
-  info "R39 MLC model: $model_name (context=$max_context_len, prefill=$prefill_chunk_size)"
+  if [[ "$R39_MLC_STACK" == "legacy" ]]; then
+    quantization="${quantization:-q4f16_ft}"
+    hf_user="dusty-nv"
+    if [[ "$model_name" == "gemma-2-2b-it" ]]; then
+      quantization="q4f16_1"
+      hf_user="mlc-ai"
+    fi
+  else
+    quantization="${quantization:-q4f16_1}"
+    hf_user="mlc-ai"
+  fi
+  model_id="HF://${hf_user}/${model_name}-${quantization}-MLC"
+
+  info "R39 MLC model: $model_name (stack=$R39_MLC_STACK, quant=$quantization, context=$max_context_len, prefill=$prefill_chunk_size)"
   docker run --runtime nvidia --rm --network host --privileged --shm-size=8g \
     --env NVIDIA_DRIVER_CAPABILITIES=all \
-    --env MLC_MODEL_ID="HF://mlc-ai/${model_name}-q4f16_1-MLC" \
+    --env MLC_MODEL_ID="$model_id" \
     --env MLC_CACHE_HOME="$MLC_CACHE_CONTAINER" \
     --env MLC_CACHE_MODE="$MLC_CACHE_MODE" \
     --env MAX_CONTEXT_LEN="$max_context_len" \
@@ -837,6 +997,30 @@ run_selected_mlc_models() {
     docker image inspect "$MLC_RUNTIME_IMAGE" >/dev/null 2>&1 || \
       die "R39 MLC image is missing: $MLC_RUNTIME_IMAGE"
     make_r39_benchmark_copy "$JETSON_CONTAINERS_DIR/packages/llm/mlc/benchmark.py"
+
+    if [[ -n "$MLC_ONLY_MODEL" ]]; then
+      case "$MLC_ONLY_MODEL" in
+        Llama-3.2-1B-Instruct|Llama-3.2-3B-Instruct|Llama-3.1-8B-Instruct|Phi-3.5-mini-instruct)
+          run_r39_mlc_model "$MLC_ONLY_MODEL" 131072 8192
+          ;;
+        Llama-2-7b-chat-hf|Qwen2.5-0.5B-Instruct|Qwen2.5-1.5B-Instruct)
+          run_r39_mlc_model "$MLC_ONLY_MODEL" 4096 4096
+          ;;
+        Qwen2.5-7B-Instruct)
+          run_r39_mlc_model "$MLC_ONLY_MODEL" 2048 1024
+          ;;
+        gemma-2-2b-it)
+          run_r39_mlc_model "$MLC_ONLY_MODEL" 4096 2048
+          ;;
+        SmolLM2-135M-Instruct|SmolLM2-360M-Instruct|SmolLM2-1.7B-Instruct)
+          run_r39_mlc_model "$MLC_ONLY_MODEL" 8192 8192
+          ;;
+        *)
+          die "Unsupported MLC_ONLY_MODEL: $MLC_ONLY_MODEL"
+          ;;
+      esac
+      return
+    fi
 
     # Match the effective context/prefill values used by NVIDIA's R36
     # benchmark.sh and the q4f16_ft model configs.  These intentionally remain
@@ -977,6 +1161,11 @@ show_status() {
   info "Docker command:    $(command -v docker 2>/dev/null || echo missing)"
   info "Docker service:    $(systemctl is-active docker.service 2>/dev/null || true)"
   info "Active swap:       $(swapon --show=NAME --noheadings 2>/dev/null | paste -sd, - || echo none)"
+  if ((L4T_MAJOR >= 39)); then
+    info "R39 MLC stack:     $R39_MLC_STACK"
+    info "MLC image:         $MLC_RUNTIME_IMAGE"
+    info "MLC cache:         $MLC_CACHE_DIR"
+  fi
 }
 
 main() {
