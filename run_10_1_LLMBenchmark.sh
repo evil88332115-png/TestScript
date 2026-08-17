@@ -43,7 +43,11 @@ if ((L4T_MAJOR >= 39)); then
   case "${R39_MLC_STACK,,}" in
     legacy|0.1.3|013)
       R39_MLC_STACK="legacy"
-      NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39-legacy}"
+      # R39 legacy uses the same MLC 0.1.3 / TVM 0.18.1 q4f16_ft stack as
+      # R36.4.  Share model_weights on NAS, but keep the generated model_lib
+      # binaries separate because the R36 and R39 copies are not identical.
+      NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache}"
+      NAS_MLC_MODEL_LIB_DIR="${NAS_MLC_MODEL_LIB_DIR:-${NAS_MLC_DIR}/model_lib-r39-legacy}"
       MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39-legacy"
       MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39-legacy"
       MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2-legacy013}"
@@ -51,6 +55,7 @@ if ((L4T_MAJOR >= 39)); then
     mlc20|0.20|current)
       R39_MLC_STACK="mlc20"
       NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache-r39}"
+      NAS_MLC_MODEL_LIB_DIR="${NAS_MLC_MODEL_LIB_DIR:-${NAS_MLC_DIR}/model_lib}"
       MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache-r39"
       MLC_CACHE_CONTAINER="/data/models/mlc/cache-r39"
       MLC_RUNTIME_IMAGE="${MLC_RUNTIME_IMAGE:-mlc:r39.2.tegra-aarch64-cu132-24.04-mlc}"
@@ -62,6 +67,7 @@ if ((L4T_MAJOR >= 39)); then
   esac
 else
   NAS_MLC_DIR="${NAS_MLC_DIR:-${NAS_MOUNT_POINT}/10-1-MLC-model-cache}"
+  NAS_MLC_MODEL_LIB_DIR="${NAS_MLC_MODEL_LIB_DIR:-${NAS_MLC_DIR}/model_lib}"
   NAS_MLC_IMAGE_BACKUP="${NAS_MLC_IMAGE_BACKUP:-}"
   MLC_CACHE_DIR="${JETSON_CONTAINERS_DIR}/data/models/mlc/cache"
   MLC_CACHE_CONTAINER="/data/models/mlc/cache"
@@ -73,7 +79,7 @@ TEGRATS_LOG="${OUTPUT_DIR}/tegrastats.log"
 TEMP_PNG="${OUTPUT_DIR}/temperature_cpu_gpu_tj.png"
 BENCHMARK_LOG="${OUTPUT_DIR}/benchmark.log"
 MLC_CSV_DEST="${OUTPUT_DIR}/mlc.csv"
-PERFORMANCE_PNG="${OUTPUT_DIR}/10-1_llm_performance_b442_vs_official.png"
+PERFORMANCE_PNG="${OUTPUT_DIR}/10-1_llm_performance.png"
 R39_BENCHMARK_DIR="${STATE_DIR}/r39-benchmark"
 R39_BENCHMARK_SCRIPT="${R39_BENCHMARK_DIR}/benchmark.py"
 TEGRATS_PID=""
@@ -218,14 +224,14 @@ select_jetpack_installation() {
 
   [[ -t 0 ]] || die "No interactive terminal is available. Set INSTALL_JETPACK=0 or INSTALL_JETPACK=1."
   while true; do
-    printf '\n是否安裝完整的 nvidia-jetpack？\n'
-    printf '  1. 是，安裝 nvidia-jetpack（下載量與安裝空間較大）\n'
-    printf '  2. 否，只安裝其餘必要工具與 Docker 環境\n'
-    read -r -p "請選擇 [1/2]：" choice
+    printf '\nInstall the complete nvidia-jetpack package?\n'
+    printf '  1. Yes, install nvidia-jetpack (larger download and disk usage)\n'
+    printf '  2. No, install only the other required tools and Docker environment\n'
+    read -r -p "Select [1/2]: " choice
     case "$choice" in
       1) INSTALL_JETPACK="1"; return ;;
       2) INSTALL_JETPACK="0"; return ;;
-      *) warn "請輸入 1 或 2。" ;;
+      *) warn "Enter 1 or 2." ;;
     esac
   done
 }
@@ -324,9 +330,40 @@ ensure_docker_group_access() {
   exec sg docker -c 'exec bash "$MAXTESTSCRIPT_REEXEC_PATH"'
 }
 
+guard_local_gui_terminal() {
+  local terminal_device
+  terminal_device="$(tty 2>/dev/null || true)"
+
+  if systemctl is-active --quiet display-manager.service \
+      && [[ -z "${SSH_CONNECTION:-}" ]] \
+      && [[ -z "${SSH_CLIENT:-}" ]] \
+      && [[ -z "${SSH_TTY:-}" ]] \
+      && [[ "$terminal_device" != /dev/tty[0-9]* ]]; then
+    printf '%s\n' \
+      'ERROR: A local GUI terminal was detected.' \
+      'Running init 3 would close the GUI and terminate this terminal and test script.' \
+      '' \
+      'Run this command first:' \
+      '  sudo init 3' \
+      '' \
+      'After entering text mode and logging in, run the test again:' \
+      "  cd $SCRIPT_DIR" \
+      "  ./$(basename "${BASH_SOURCE[0]}")" >&2
+    return 1
+  fi
+}
+
+print_gui_restore_hint() {
+  if ! systemctl is-active --quiet display-manager.service; then
+    printf '\nTo return to GUI mode, run:\n'
+    printf '  sudo init 5\n'
+  fi
+}
+
 switch_to_runlevel_3() {
   local started_at elapsed
 
+  guard_local_gui_terminal
   ensure_sudo_auth
   if systemctl is-active --quiet display-manager.service; then
     info "Switching the current boot to runlevel 3 with: sudo init 3"
@@ -597,18 +634,18 @@ select_mlc_cache_mode() {
 
   [[ -t 0 ]] || die "No interactive terminal is available. Set MLC_CACHE_MODE=remove, keep, upload, or download."
   while true; do
-    printf '\nMLC 模型與快取要如何處理？\n'
-    printf '  1. 原流程（模型與 JIT 快取會移除）\n'
-    printf '  2. 留下模型（下次執行可重用，會占用 SSD 空間）\n'
-    printf '  3. 將已保留的模型上傳到 NAS（不執行 benchmark）\n'
-    printf '  4. 從 NAS 下載模型並放回 cache，然後執行 benchmark\n'
-    read -r -p "請選擇 [1/2/3/4]：" choice
+    printf '\nHow should MLC models and caches be handled?\n'
+    printf '  1. Original flow (remove model and JIT caches after use)\n'
+    printf '  2. Keep models for reuse (uses SSD space)\n'
+    printf '  3. Upload the retained model cache to NAS (do not run benchmark)\n'
+    printf '  4. Restore the model cache from NAS, then run benchmark\n'
+    read -r -p "Select [1/2/3/4]: " choice
     case "$choice" in
       1) MLC_CACHE_MODE="remove"; return ;;
       2) MLC_CACHE_MODE="keep"; return ;;
       3) MLC_CACHE_MODE="upload"; return ;;
       4) MLC_CACHE_MODE="download"; return ;;
-      *) warn "請輸入 1、2、3 或 4。" ;;
+      *) warn "Enter 1, 2, 3, or 4." ;;
     esac
   done
 }
@@ -625,14 +662,14 @@ select_mlc_model_count() {
 
   [[ -t 0 ]] || die "No interactive terminal is available. Set MLC_MODEL_COUNT=6 or MLC_MODEL_COUNT=12."
   while true; do
-    printf '\n要執行幾個 MLC 模型？\n'
-    printf '  1. 執行精簡的 6 個模型\n'
-    printf '  2. 執行 benchmark.sh 完整的 12 個模型\n'
-    read -r -p "請選擇 [1/2]：" choice
+    printf '\nHow many MLC models should be benchmarked?\n'
+    printf '  1. Run the reduced 6-model set\n'
+    printf '  2. Run the complete 12-model benchmark.sh set\n'
+    read -r -p "Select [1/2]: " choice
     case "$choice" in
       1) MLC_MODEL_COUNT="6"; return ;;
       2) MLC_MODEL_COUNT="12"; return ;;
-      *) warn "請輸入 1 或 2。" ;;
+      *) warn "Enter 1 or 2." ;;
     esac
   done
 }
@@ -662,20 +699,33 @@ ensure_rsync() {
 
 copy_cache_with_progress() {
   local source="$1" destination="$2"
-  rsync -aL --human-readable --info=progress2 --no-inc-recursive \
+  rsync -rltL --human-readable --info=progress2 --no-inc-recursive \
     "$source/" "$destination/"
+}
+
+copy_cache_without_model_libs_with_progress() {
+  local source="$1" destination="$2" comparison="${3:-default}"
+  local rsync_args=(
+    -rltL --human-readable --info=progress2 --no-inc-recursive
+    --exclude='/model_lib/***'
+    --exclude='/model_lib-r39-legacy/***'
+  )
+  if [[ "$comparison" == "size-only" ]]; then
+    rsync_args+=(--size-only)
+  fi
+  rsync "${rsync_args[@]}" "$source/" "$destination/"
 }
 
 copy_six_model_cache_with_progress() {
   local source="$1" destination="$2"
   local include_rules=(
     '/.gitkeep'
-    '/model_lib/***'
     '/model_weights/'
     '/model_weights/hf/'
   )
   local rsync_args=(
-    -aL --human-readable --info=progress2 --no-inc-recursive
+    -rltL --human-readable --info=progress2 --no-inc-recursive
+    --size-only
     --prune-empty-dirs
   )
   local rule
@@ -723,16 +773,26 @@ upload_mlc_cache_to_nas() {
     die "No retained MLC model cache was found at $MLC_CACHE_DIR. Run option 2 first."
 
   ensure_rsync
-  mkdir -p "$NAS_MLC_DIR"
+  mkdir -p "$NAS_MLC_DIR" "$NAS_MLC_MODEL_LIB_DIR"
   info "Uploading retained MLC model cache to NAS..."
   show_cache_size "$MLC_CACHE_DIR" "Local cache"
-  # Dereference any cache symlinks because CIFS shares commonly do not support them.
-  copy_cache_with_progress "$MLC_CACHE_DIR" "$NAS_MLC_DIR"
+  # Model weights are shared by R36 and R39 legacy.  Generated model_lib
+  # binaries are stored separately because an identical cache filename can
+  # contain a different binary on the two releases.
+  # The shared R36/R39 model files can have different mtimes even when their
+  # paths and sizes are identical.  Avoid re-uploading those large files.
+  copy_cache_without_model_libs_with_progress "$MLC_CACHE_DIR" "$NAS_MLC_DIR" size-only
+  if directory_has_files "$MLC_CACHE_DIR/model_lib"; then
+    copy_cache_with_progress "$MLC_CACHE_DIR/model_lib" "$NAS_MLC_MODEL_LIB_DIR"
+  else
+    warn "No compiled model libraries were found at $MLC_CACHE_DIR/model_lib"
+  fi
   printf 'source=%s\nhost=%s\nupdated=%s\n' \
     "$MLC_CACHE_DIR" "$(hostname)" "$(date --iso-8601=seconds)" \
     > "$NAS_MLC_DIR/.MaxTestScript-backup-info"
   sync
   show_cache_size "$NAS_MLC_DIR" "NAS backup"
+  show_cache_size "$NAS_MLC_MODEL_LIB_DIR" "NAS model libraries"
   pass "RESULT,MLC_CACHE,NAS_UPLOAD,PASS,path=$NAS_MLC_DIR"
 }
 
@@ -742,13 +802,24 @@ download_mlc_cache_from_nas() {
     die "No MLC model backup was found at $NAS_MLC_DIR. Upload one with option 3 first."
 
   ensure_rsync
-  mkdir -p "$MLC_CACHE_DIR"
+  # Docker creates cache files as root.  Make the host-side restore target
+  # writable by the test user before rsync creates temporary files there.
+  ensure_sudo_auth
+  run_sudo mkdir -p "$MLC_CACHE_DIR"
+  run_sudo chown -R "$(id -u "$TEST_USER"):$(id -g "$TEST_USER")" "$MLC_CACHE_DIR"
   info "Restoring the $MLC_MODEL_COUNT-model MLC cache set from NAS..."
   show_cache_size "$NAS_MLC_DIR" "NAS backup"
   if [[ "$MLC_MODEL_COUNT" == "6" ]]; then
     copy_six_model_cache_with_progress "$NAS_MLC_DIR" "$MLC_CACHE_DIR"
   else
-    copy_cache_with_progress "$NAS_MLC_DIR" "$MLC_CACHE_DIR"
+    copy_cache_without_model_libs_with_progress "$NAS_MLC_DIR" "$MLC_CACHE_DIR" size-only
+  fi
+  mkdir -p "$MLC_CACHE_DIR/model_lib"
+  if directory_has_files "$NAS_MLC_MODEL_LIB_DIR"; then
+    info "Restoring compatible model libraries from: $NAS_MLC_MODEL_LIB_DIR"
+    copy_cache_with_progress "$NAS_MLC_MODEL_LIB_DIR" "$MLC_CACHE_DIR/model_lib"
+  else
+    warn "No compatible model libraries found at $NAS_MLC_MODEL_LIB_DIR; MLC will rebuild them as needed."
   fi
   rm -f "$MLC_CACHE_DIR/.MaxTestScript-backup-info"
   sync
@@ -886,7 +957,7 @@ detect_dut_name() {
   fi
 
   os_version="$(cat /etc/os_version 2>/dev/null || true)"
-  detected="$(printf '%s\n' "$os_version" | grep -oE 'B[0-9]+' | head -n 1 || true)"
+  detected="$(printf '%s\n' "$os_version" | sed -n '1{s/_.*//;s/^[[:space:]]*//;s/[[:space:]]*$//;p}')"
   if [[ -n "$detected" ]]; then
     printf '%s\n' "$detected"
   else
@@ -1169,10 +1240,14 @@ show_status() {
 }
 
 main() {
+  local benchmark_rc
+
   if ((STATUS_ONLY)); then
     show_status
     exit 0
   fi
+
+  guard_local_gui_terminal
 
   if ((FORCE_PREPARE)) || [[ ! -e "$PREPARED_MARKER" ]]; then
     select_jetpack_installation
@@ -1183,7 +1258,13 @@ main() {
   ensure_docker_group_access
   ensure_jetson_containers
   ensure_r39_mlc_image
-  run_benchmark
+  if run_benchmark; then
+    benchmark_rc=0
+  else
+    benchmark_rc=$?
+  fi
+  print_gui_restore_hint
+  return "$benchmark_rc"
 }
 
 main "$@"
